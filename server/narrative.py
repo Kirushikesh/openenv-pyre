@@ -124,12 +124,12 @@ def build_narrative_observation(
     if agent_evacuated:
         return _terminal_obs(step_count, last_action_feedback,
                              narrative="You have safely evacuated the building.",
-                             agent_evacuated=True)
+                             agent_evacuated=True, agent_health=agent_health)
 
     if not agent_alive:
         return _terminal_obs(step_count, last_action_feedback,
                              narrative="You have been overcome by fire and smoke.",
-                             agent_evacuated=False)
+                             agent_evacuated=False, agent_health=0.0)
 
     visible = compute_visible_cells(agent_x, agent_y, cell_grid, smoke_grid, w, h)
 
@@ -467,6 +467,7 @@ def _terminal_obs(
     last_action_feedback: str,
     narrative: str,
     agent_evacuated: bool = False,
+    agent_health: float = 0.0,
 ) -> Dict[str, Any]:
     return {
         "narrative": narrative,
@@ -475,8 +476,8 @@ def _terminal_obs(
         "smoke_level": "none",
         "fire_visible": False,
         "fire_direction": None,
-        "agent_health": 0.0 if not agent_evacuated else 100.0,
-        "health_status": "Critical" if not agent_evacuated else "Good",
+        "agent_health": agent_health,
+        "health_status": _health_label(agent_health),
         "wind_dir": "CALM",
         "visible_objects": [],
         "blocked_exit_ids": [],

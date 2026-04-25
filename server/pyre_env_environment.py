@@ -36,9 +36,9 @@ from openenv.core.env_server.interfaces import Environment
 
 from ..models import PyreAction, PyreMapState, PyreObservation, PyreState
 from .fire_sim import FireSim, FIRE_BURNING, smoke_level_label, WIND_DIRS
-from .floor_plan import generate_episode, template_names
+from .floor_plan import generate_episode, generate_procedural_floor_plan, template_names
 from .narrative import build_look_result, build_narrative_observation, compute_visible_cells
-from .rubrics import make_per_step_rubrics, make_episode_end_rubrics
+from .rubrics import make_per_step_rubrics, make_episode_end_rubrics, bfs_exit_dist, unblocked_exits, BFS_INF
 
 # Cell type constants
 FLOOR = 0
@@ -70,6 +70,10 @@ _DIFFICULTY_PRESETS: Dict[str, Dict] = {
         "humidity_range": (0.30, 0.50),
         "wind_choices": ["CALM"],
         "max_steps_override": 200,
+        # Map layout: fixed 16×16 templates (stable topology aids early learning)
+        "use_procedural": False,
+        "grid_dims": (16, 16),
+        "n_rooms_range": None,
     },
     "medium": {
         "n_sources_range": (2, 4),
@@ -77,6 +81,10 @@ _DIFFICULTY_PRESETS: Dict[str, Dict] = {
         "humidity_range": (0.10, 0.45),
         "wind_choices": list(WIND_DIRS.keys()),
         "max_steps_override": None,  # use env default
+        # Map layout: fixed 16×16 templates (same 3 buildings, fire varies)
+        "use_procedural": False,
+        "grid_dims": (16, 16),
+        "n_rooms_range": None,
     },
     "hard": {
         "n_sources_range": (3, 5),
@@ -84,6 +92,10 @@ _DIFFICULTY_PRESETS: Dict[str, Dict] = {
         "humidity_range": (0.05, 0.20),
         "wind_choices": [d for d in WIND_DIRS.keys() if d != "CALM"],
         "max_steps_override": 100,
+        # Map layout: procedurally generated 20×24 building — every episode unique
+        "use_procedural": True,
+        "grid_dims": (20, 24),
+        "n_rooms_range": (6, 10),
     },
 }
 
@@ -130,6 +142,11 @@ class PyreEnvironment(Environment):
         self._episode_counter = 0
         self._last_feedback = ""
 
+        # Episode-scoped reward tracking (reset each episode)
+        self._visited_cells: set = set()
+        self._min_exit_dist_reached: int = BFS_INF
+        self._rewarded_doors: set = set()
+
     # ------------------------------------------------------------------
     # OpenEnv API
     # ------------------------------------------------------------------
@@ -161,11 +178,24 @@ class PyreEnvironment(Environment):
         wind_dir = self._rng.choice(wind_pool)
 
         # --- Floor plan ---
-        templates = template_names()
-        template_name = templates[self._episode_counter % len(templates)]
-        floor_plan, _, _, agent_start = generate_episode(
-            template_name, npc_count=0, seed=fire_seed
-        )
+        if preset["use_procedural"]:
+            pw, ph = preset["grid_dims"]
+            floor_plan = generate_procedural_floor_plan(
+                w=pw, h=ph, rng=self._rng,
+                n_rooms_range=preset["n_rooms_range"],
+            )
+            agent_start = self._rng.choice(floor_plan.agent_spawn_options)
+            # Randomise some doors closed at episode start (same 30% rule as generate_episode)
+            for dpos in floor_plan.door_positions:
+                if self._rng.random() < 0.3:
+                    floor_plan.cell_grid[_idx(dpos[0], dpos[1], pw)] = DOOR_CLOSED
+            template_name = floor_plan.name
+        else:
+            templates = template_names()
+            template_name = templates[self._episode_counter % len(templates)]
+            floor_plan, _, _, agent_start = generate_episode(
+                template_name, npc_count=0, seed=fire_seed
+            )
 
         w, h = floor_plan.w, floor_plan.h
         n_cells = w * h
@@ -235,6 +265,11 @@ class PyreEnvironment(Environment):
             wind_dir=wind_dir,
             humidity=humidity,
         )
+
+        # Reset episode-scoped reward tracking
+        self._visited_cells = {(self._state.agent_x, self._state.agent_y)}
+        self._min_exit_dist_reached = BFS_INF
+        self._rewarded_doors = set()
 
         self._fire_sim = FireSim(
             w=w, h=h, rng=self._rng,
@@ -320,6 +355,19 @@ class PyreEnvironment(Environment):
 
         st.step_count += 1
 
+        # --- Episode-scoped reward tracking ---
+        # Detect first visit to current cell (before adding to visited set)
+        is_new_cell = (st.agent_x, st.agent_y) not in self._visited_cells
+        self._visited_cells.add((st.agent_x, st.agent_y))
+
+        # Track closest approach to any exit for NearMissBonus
+        _exits = unblocked_exits(st.exit_positions, st.fire_grid, st.grid_w)
+        if not _exits:
+            _exits = st.exit_positions
+        _cur_dist = bfs_exit_dist(st.agent_x, st.agent_y, _exits, st.cell_grid, st.grid_w, st.grid_h)
+        if _cur_dist < self._min_exit_dist_reached:
+            self._min_exit_dist_reached = _cur_dist
+
         # --- Done check ---
         done = self._check_done(st)
 
@@ -331,6 +379,7 @@ class PyreEnvironment(Environment):
             prev_agent_x=prev_agent_x,
             prev_agent_y=prev_agent_y,
             health_damage=health_damage,
+            is_new_cell=is_new_cell,
             st=st,
             done=done,
         )
@@ -492,6 +541,7 @@ class PyreEnvironment(Environment):
         prev_agent_x: int,
         prev_agent_y: int,
         health_damage: float,
+        is_new_cell: bool,
         st: PyreState,
         done: bool,
     ) -> float:
@@ -513,8 +563,12 @@ class PyreEnvironment(Environment):
             done=done,
             agent_evacuated=st.agent_evacuated,
             agent_alive=st.agent_alive,
+            agent_health=st.agent_health,
             health_damage=health_damage,
             remaining_steps=max(0, st.max_steps - st.step_count),
+            is_new_cell=is_new_cell,
+            min_exit_dist_reached=self._min_exit_dist_reached,
+            rewarded_doors=self._rewarded_doors,
         )
 
         total = 0.0

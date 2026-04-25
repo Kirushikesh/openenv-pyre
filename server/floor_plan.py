@@ -23,6 +23,14 @@ import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Cell type constants (mirrors fire_sim.py and models.py)
+FLOOR = 0
+WALL = 1
+DOOR_OPEN = 2
+DOOR_CLOSED = 3
+EXIT = 4
+OBSTACLE = 5
+
 
 # ---------------------------------------------------------------------------
 # FloorPlan dataclass
@@ -135,9 +143,9 @@ def _cell_type(grid: List[int], x: int, y: int, w: int) -> int:
 #   Row  3: W F F F W F F F W F F F W F F W
 #   Row  4: W W D W W W D W W W D W W W D W  ← room→corridor doors
 #   Row  5: W F F F F F F F F F F F F F F W  ← main corridor
-#   Row  6: W F F F F F F F F F F F F F F W
-#   Row  7: E F F F F F F F F F F F F F F E  ← exits
-#   Row  8: W F F F F F F F F F F F F F F W
+#   Row  6: E F F F F F F F F F F F F F F W  ← west exit (staggered up)
+#   Row  7: W F F F F F F F F F F F F F F W
+#   Row  8: W F F F F F F F F F F F F F F E  ← east exit (staggered down)
 #   Row  9: W F F F F F F F F F F F F F F W
 #   Row 10: W W D W W W D W W W D W W W D W  ← room→corridor doors
 #   Row 11: W F F F W F F F W F F F W F F W
@@ -156,9 +164,9 @@ def _make_small_office() -> FloorPlan:
         [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1],  # 3
         [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1],  # 4  doors
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 5  corridor
-        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 6
-        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],  # 7  exits
-        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 8
+        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 6  west exit
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 7
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],  # 8  east exit
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 9
         [1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 1, 2, 1],  # 10 doors
         [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1],  # 11
@@ -169,7 +177,7 @@ def _make_small_office() -> FloorPlan:
     ]
     grid = [c for row in rows for c in row]
 
-    exit_positions = [(0, 7), (15, 7)]
+    exit_positions = [(0, 6), (15, 8)]
     door_positions = [(2, 4), (6, 4), (10, 4), (14, 4),
                       (2, 10), (6, 10), (10, 10), (14, 10)]
 
@@ -482,3 +490,325 @@ def generate_episode(
     fire_start = rng.choice(candidates)
 
     return fp_copy, fire_start, npc_positions, agent_start
+
+
+# ---------------------------------------------------------------------------
+# Procedural floor plan generator
+# ---------------------------------------------------------------------------
+#
+# Algorithm — Room-and-Corridor (4 phases):
+#   1. Room placement   — random non-overlapping rectangles
+#   2. MST corridors    — Prim-style minimum spanning tree connecting all rooms
+#   3. Exit placement   — 2 exits on outer wall, maximally far apart
+#   4. Zone + maps      — label cells, derive fuel/ventilation via existing helper
+#
+# Connectivity guard: BFS from a random agent spawn to confirm ≥1 exit is
+# reachable. Up to 3 attempts; falls back to "small_office" if all fail.
+# ---------------------------------------------------------------------------
+
+# Room size ranges (interior dimensions, excluding surrounding walls)
+_ROOM_MIN_W, _ROOM_MAX_W = 3, 5
+_ROOM_MIN_H, _ROOM_MAX_H = 3, 4
+
+
+def _rooms_collide(r1: Tuple[int, int, int, int], r2: Tuple[int, int, int, int]) -> bool:
+    """True if two interior rectangles are too close (need ≥1-cell wall gap)."""
+    x1a, y1a, x2a, y2a = r1
+    x1b, y1b, x2b, y2b = r2
+    # Pad each room by 1 on all sides; collision if padded rects overlap.
+    return not (x2a + 2 <= x1b or x2b + 2 <= x1a or y2a + 2 <= y1b or y2b + 2 <= y1a)
+
+
+def _carve_hline(grid: List[int], x_start: int, x_end: int, y: int, w: int) -> None:
+    for x in range(min(x_start, x_end), max(x_start, x_end) + 1):
+        if 0 < x < w - 1:  # never overwrite outer boundary
+            grid[y * w + x] = FLOOR
+
+
+def _carve_vline(grid: List[int], y_start: int, y_end: int, x: int, w: int, h: int) -> None:
+    for y in range(min(y_start, y_end), max(y_start, y_end) + 1):
+        if 0 < y < h - 1:  # never overwrite outer boundary
+            grid[y * w + x] = FLOOR
+
+
+def _proc_bfs_reachable(
+    sx: int, sy: int,
+    exits: List[Tuple[int, int]],
+    grid: List[int],
+    w: int, h: int,
+) -> bool:
+    """Return True if any exit in `exits` is reachable from (sx, sy) via BFS."""
+    exit_set = set(exits)
+    if (sx, sy) in exit_set:
+        return True
+    visited = {(sx, sy)}
+    queue = [(sx, sy)]
+    while queue:
+        cx, cy = queue.pop(0)
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            if (nx, ny) in visited:
+                continue
+            ct = grid[ny * w + nx]
+            if ct in (WALL, OBSTACLE):
+                continue
+            if (nx, ny) in exit_set:
+                return True
+            visited.add((nx, ny))
+            queue.append((nx, ny))
+    return False
+
+
+def _try_generate_procedural(
+    w: int,
+    h: int,
+    rng: random.Random,
+    n_rooms_range: Tuple[int, int],
+) -> Optional[FloorPlan]:
+    """Single generation attempt. Returns FloorPlan on success, None on failure."""
+
+    grid = [WALL] * (w * h)
+    rooms: List[Tuple[int, int, int, int]] = []  # (x1, y1, x2, y2) interior rects
+
+    # ------------------------------------------------------------------
+    # Phase 1: Room placement
+    # ------------------------------------------------------------------
+    n_rooms = rng.randint(*n_rooms_range)
+
+    for _ in range(n_rooms):
+        for _attempt in range(200):
+            rw = rng.randint(_ROOM_MIN_W, _ROOM_MAX_W)
+            rh = rng.randint(_ROOM_MIN_H, _ROOM_MAX_H)
+            # Keep 1-cell margin from outer boundary so exits can be placed cleanly
+            x1 = rng.randint(2, w - rw - 3)
+            y1 = rng.randint(2, h - rh - 3)
+            x2 = x1 + rw - 1
+            y2 = y1 + rh - 1
+            new_room = (x1, y1, x2, y2)
+            if not any(_rooms_collide(new_room, r) for r in rooms):
+                rooms.append(new_room)
+                for ry in range(y1, y2 + 1):
+                    for rx in range(x1, x2 + 1):
+                        grid[ry * w + rx] = FLOOR
+                break
+
+    if len(rooms) < 2:
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 2: MST corridors (Prim-style, nearest-centre)
+    # ------------------------------------------------------------------
+    centers = [((x1 + x2) // 2, (y1 + y2) // 2) for x1, y1, x2, y2 in rooms]
+    room_cell_set: set = set()
+    for x1, y1, x2, y2 in rooms:
+        for ry in range(y1, y2 + 1):
+            for rx in range(x1, x2 + 1):
+                room_cell_set.add((rx, ry))
+
+    connected = [0]
+    unconnected = list(range(1, len(rooms)))
+
+    while unconnected:
+        best_dist, best_c, best_u = float("inf"), -1, -1
+        for c in connected:
+            for u in unconnected:
+                cx_c, cy_c = centers[c]
+                cx_u, cy_u = centers[u]
+                d = abs(cx_c - cx_u) + abs(cy_c - cy_u)
+                if d < best_dist:
+                    best_dist, best_c, best_u = d, c, u
+
+        cx_a, cy_a = centers[best_c]
+        cx_b, cy_b = centers[best_u]
+
+        # L-shaped corridor: random choice of which leg to draw first
+        if rng.random() < 0.5:
+            _carve_hline(grid, cx_a, cx_b, cy_a, w)
+            _carve_vline(grid, cy_a, cy_b, cx_b, w, h)
+        else:
+            _carve_vline(grid, cy_a, cy_b, cx_a, w, h)
+            _carve_hline(grid, cx_a, cx_b, cy_b, w)
+
+        connected.append(best_u)
+        unconnected.remove(best_u)
+
+    # ------------------------------------------------------------------
+    # Derive corridor cell set (FLOOR cells not inside any room)
+    # ------------------------------------------------------------------
+    corridor_cell_set: set = set()
+    for y in range(1, h - 1):
+        for x in range(1, w - 1):
+            if grid[y * w + x] == FLOOR and (x, y) not in room_cell_set:
+                corridor_cell_set.add((x, y))
+
+    # ------------------------------------------------------------------
+    # Place DOOR_OPEN at room–corridor junctions (max 2 doors per room)
+    # ------------------------------------------------------------------
+    door_positions: List[Tuple[int, int]] = []
+    doors_per_room = [0] * len(rooms)
+
+    # Junction cells: corridor cells immediately adjacent to a room interior
+    junction_candidates: List[Tuple[int, int]] = []
+    for cx, cy in sorted(corridor_cell_set):  # sorted for determinism
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            if (cx + dx, cy + dy) in room_cell_set:
+                junction_candidates.append((cx, cy))
+                break
+
+    for jx, jy in junction_candidates:
+        for i, (x1, y1, x2, y2) in enumerate(rooms):
+            if doors_per_room[i] >= 2:
+                continue
+            # Is this junction adjacent to room i?
+            adjacent = False
+            for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+                if x1 <= jx + dx <= x2 and y1 <= jy + dy <= y2:
+                    adjacent = True
+                    break
+            if adjacent:
+                grid[jy * w + jx] = DOOR_OPEN
+                door_positions.append((jx, jy))
+                doors_per_room[i] += 1
+                break  # one room association per door cell
+
+    # ------------------------------------------------------------------
+    # Phase 3: Exit placement via dedicated tunnels
+    #
+    # Rather than relying on floor cells reaching the inner boundary, we
+    # explicitly tunnel from the leftmost and rightmost floor cells to the
+    # west (x=0) and east (x=w-1) outer walls. This is deterministic and
+    # always succeeds as long as any floor cells were placed.
+    # ------------------------------------------------------------------
+    current_floor = [
+        (x, y) for y in range(1, h - 1)
+        for x in range(1, w - 1)
+        if grid[y * w + x] == FLOOR
+    ]
+    if len(current_floor) < 2:
+        return None
+
+    # Exit 1 — west wall: use floor cell on leftmost column; carve west.
+    left_cell = min(current_floor, key=lambda p: p[0])
+    lx, ly = left_cell
+    for cx in range(1, lx):           # carve any wall cells between x=1 and room
+        grid[ly * w + cx] = FLOOR
+    grid[ly * w + 0] = EXIT
+    exit1: Tuple[int, int] = (0, ly)
+
+    # Exit 2 — east wall: use floor cell on rightmost column; carve east.
+    right_cell = max(current_floor, key=lambda p: p[0])
+    rx, ry = right_cell
+    for cx in range(rx + 1, w - 1):  # carve any wall cells between room and x=w-2
+        grid[ry * w + cx] = FLOOR
+    grid[ry * w + (w - 1)] = EXIT
+    exit2: Tuple[int, int] = (w - 1, ry)
+
+    exit_positions_list: List[Tuple[int, int]] = [exit1, exit2]
+
+    # ------------------------------------------------------------------
+    # Phase 4: Zone map, fuel, and ventilation
+    #
+    # Rebuild corridor_cell_set from the current grid so that exit tunnel
+    # cells (carved in Phase 3) are included and labelled correctly.
+    # ------------------------------------------------------------------
+    corridor_cell_set = {
+        (x, y)
+        for y in range(1, h - 1)
+        for x in range(1, w - 1)
+        if grid[y * w + x] == FLOOR and (x, y) not in room_cell_set
+    }
+
+    zone_map: Dict[str, str] = {}
+
+    # Rooms: use positional zone labels that match existing _FUEL_BY_ZONE / _VENT_BY_ZONE
+    for i, (x1, y1, x2, y2) in enumerate(rooms):
+        cx_room = (x1 + x2) // 2
+        zone_label = "west_rooms" if cx_room < w // 2 else "east_rooms"
+        for ry2 in range(y1, y2 + 1):
+            for rx2 in range(x1, x2 + 1):
+                if grid[ry2 * w + rx2] == FLOOR:
+                    zone_map[f"{rx2},{ry2}"] = zone_label
+
+    # Corridors (including exit tunnel cells) and doors
+    for cx, cy in corridor_cell_set:
+        if grid[cy * w + cx] in (FLOOR, DOOR_OPEN):
+            zone_map[f"{cx},{cy}"] = "main_corridor"
+    for dx, dy in door_positions:
+        zone_map[f"{dx},{dy}"] = "main_corridor"
+
+    # Exits
+    for ex, ey in exit_positions_list:
+        zone_map[f"{ex},{ey}"] = "exit"
+
+    fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, w, h)
+
+    # ------------------------------------------------------------------
+    # Agent spawn options and connectivity guard
+    # ------------------------------------------------------------------
+    all_floor_cells = [
+        (x, y) for y in range(h) for x in range(w)
+        if grid[y * w + x] in (FLOOR, DOOR_OPEN)
+    ]
+
+    # Prefer corridor cells ≥4 cells from any exit (Manhattan)
+    agent_spawn_options = [
+        (x, y) for x, y in corridor_cell_set
+        if grid[y * w + x] == FLOOR
+        and all(
+            abs(x - ex) + abs(y - ey) >= 4
+            for ex, ey in exit_positions_list
+        )
+    ]
+    if not agent_spawn_options:
+        agent_spawn_options = [
+            (x, y) for x, y in all_floor_cells
+            if (x, y) not in exit_positions_list
+        ]
+    if not agent_spawn_options:
+        return None
+
+    # Connectivity guard: BFS from a sample spawn to verify exit is reachable
+    test_spawn = rng.choice(agent_spawn_options)
+    if not _proc_bfs_reachable(test_spawn[0], test_spawn[1], exit_positions_list, grid, w, h):
+        return None
+
+    return FloorPlan(
+        name=f"procedural_{w}x{h}",
+        cell_grid=grid,
+        w=w, h=h,
+        exit_positions=exit_positions_list,
+        door_positions=door_positions,
+        spawn_zones=all_floor_cells,
+        agent_spawn_options=agent_spawn_options,
+        zone_map=zone_map,
+        fire_min_exit_dist=5,
+        fuel_map=fuel_map,
+        ventilation_map=ventilation_map,
+    )
+
+
+def generate_procedural_floor_plan(
+    w: int,
+    h: int,
+    rng: random.Random,
+    n_rooms_range: Tuple[int, int] = (6, 10),
+) -> FloorPlan:
+    """Generate a randomised floor plan procedurally.
+
+    Tries up to 3 times with the given rng. Falls back to the hand-authored
+    "small_office" template if all attempts fail (guarantees a valid plan is
+    always returned).
+
+    Args:
+        w, h:           Grid dimensions (e.g. 20, 24 for hard difficulty).
+        rng:            Seeded Random instance from the environment.
+        n_rooms_range:  (min, max) number of rooms to attempt placing.
+    """
+    for _ in range(3):
+        fp = _try_generate_procedural(w, h, rng, n_rooms_range)
+        if fp is not None:
+            return fp
+    # Fallback: small_office is always valid and always connected
+    return get_template("small_office")

@@ -13,9 +13,9 @@ tags:
 
 # Pyre — Crisis Navigation Environment for LLM Agents
 
-> *When buildings burn, the difference between a safe evacuation and a tragedy is the quality of decisions made in the first 60 seconds. Can we train an LLM to be the right kind of guide?*
+> *When buildings burn, the difference between a safe evacuation and a tragedy is the quality of decisions made in the first 60 seconds. Can we train an LLM to make them?*
 
-**Pyre** places an LLM agent *inside* a burning building. The agent must navigate to safety while simultaneously coordinating nearby civilians toward exits, managing fire spread through door control, and reasoning under partial observability — all with no global map and hard time pressure.
+**Pyre** places an LLM agent *inside* a burning building. The agent must navigate to safety under partial observability — no global map, hard time pressure, and a fire that actively spreads and blocks exits.
 
 ---
 
@@ -24,13 +24,12 @@ tags:
 | Feature | `grid_world` | `maze_env` | `wildfire_env` | **Pyre** |
 |---|---|---|---|---|
 | Observability | Full | Full | Partial | **Partial, first-person, text** |
-| Map dynamics | Static | Static | Dynamic (fire) | **Dynamic (fire + doors + crowd)** |
-| Other entities | None | None | Few | **Many NPCs with behavior model** |
-| Action richness | 4 moves | 4 moves | Suppression | **Movement + door control + speech acts** |
-| Agent role | Mover | Mover | Suppressor | **Coordinator + survivor** |
-| Reward complexity | Reach goal | Reach goal | Suppress fire | **13-component composite rubric** |
+| Map dynamics | Static | Static | Dynamic (fire) | **Dynamic (fire + doors)** |
+| Action richness | 4 moves | 4 moves | Suppression | **Movement + door control + look** |
+| Agent role | Mover | Mover | Suppressor | **Survivor** |
+| Reward complexity | Reach goal | Reach goal | Suppress fire | **8-component composite rubric** |
 
-*`wildfire_env` trains an agent to fight fires from above; Pyre trains an agent to survive and lead others out from inside.*
+*`wildfire_env` trains an agent to fight fires from above; Pyre trains an agent to survive from inside.*
 
 ---
 
@@ -40,13 +39,13 @@ Every step the agent receives a first-person text observation:
 
 ```
 You are in the **main_corridor**. The air is **moderate**.
-Flames are visible to the **east**.
-3 people nearby: p_3 (panicked) is 2m north, p_7 (calm) is 3m west, p_1 (injured) is 1m east.
-Exit visible: exit at 8m west.
-Doors: door_2 (closed) at 2m east.
-You hear: Fire alarm sounding; Screaming from nearby.
+Health: ████████░░ (85/100) | Wind: **EAST**
+Flames are visible to the **west**.
+Exits visible: exit_0_7 at 8m west.
+Doors: door_1 (closed) at 2m east.
+You hear: Fire alarm sounding; Smoke detector beeping.
 Last action: You move south. The smoke is thick here.
-Available actions: move(direction='north')  move(direction='west')  close_door(target_id='door_2')  instruct(target_id='p_3', direction='west')  wait()
+Available actions: move(direction='north')  move(direction='south')  door(target_id='door_1', door_state='open')  look(direction='east')  wait()
 ```
 
 ---
@@ -56,10 +55,8 @@ Available actions: move(direction='north')  move(direction='west')  close_door(t
 | Action | Parameters | Effect |
 |---|---|---|
 | `move` | `direction` | Move one cell N/S/E/W |
-| `instruct` | `target_id`, `direction` | Direct nearby NPC (compliance depends on NPC state) |
-| `close_door` | `target_id` | Close door — slows fire 7× but may trap NPCs |
-| `open_door` | `target_id` | Open a closed door |
-| `broadcast` | `zone`, `category` | Instruct all NPCs in a zone at once |
+| `door` | `target_id`, `door_state` | Open or close a nearby door — closed doors slow fire spread to 15% |
+| `look` | `direction` | Scan up to 5 cells in one direction for detailed zone/fire/smoke info |
 | `wait` | — | Skip turn |
 
 ---
@@ -68,20 +65,15 @@ Available actions: move(direction='north')  move(direction='west')  close_door(t
 
 **Per step:**
 - `-0.01` constant time penalty
-- `+0.1` moved closer to exit
-- `-0.5` moved into heavy smoke or fire-adjacent cell
-- `+0.2` issued instruction an NPC followed toward exit
-- `-0.05` issued instruction no one followed
-- `+0.5` closed door adjacent to active fire (strategic)
-- `-2.0` closed door that later trapped a casualty NPC
+- `+0.1` moved closer to nearest unblocked exit (BFS distance)
+- `-0.5` moved into smoke ≥ moderate or fire-adjacent cell
+- `-0.02 × damage` health drain from smoke/fire exposure
+- `+0.5` closed a door adjacent to active fire (strategic)
 
 **Episode end:**
 - `+5.0` agent evacuated alive
 - `-10.0` agent incapacitated
-- `+1.0 × N` per NPC evacuated
-- `-2.0 × N` per NPC casualty
-- `+3.0` no stampede occurred
-- `-1.5 × N` per stampede event
+- `+0.05 × remaining_steps` time bonus for fast evacuation
 
 ---
 
@@ -95,8 +87,10 @@ uv run server   # → http://localhost:8000
 # Health check
 curl http://localhost:8000/health
 
-# Reset
-curl -X POST http://localhost:8000/reset
+# Reset (difficulty: easy | medium | hard)
+curl -X POST http://localhost:8000/reset \
+  -H "Content-Type: application/json" \
+  -d '{"difficulty": "medium"}'
 
 # Step
 curl -X POST http://localhost:8000/step \
@@ -116,8 +110,18 @@ with PyreEnv(base_url="http://localhost:8000") as env:
     result = env.reset()
     print(result.observation.narrative)
     result = env.step(PyreAction(action="move", direction="north"))
-    print(f"Reward: {result.reward}")
+    print(f"Reward: {result.reward}, Health: {result.observation.agent_health}")
 ```
+
+---
+
+## Difficulty levels
+
+| Level | Fire sources | Spread rate | Wind | Humidity | Max steps |
+|---|---|---|---|---|---|
+| `easy` | 1 | 10–20% | Calm | 30–50% | 200 |
+| `medium` | 2–4 | 15–40% | Any | 10–45% | 150 |
+| `hard` | 3–5 | 30–55% | Never calm | 5–20% | 100 |
 
 ---
 
@@ -133,7 +137,7 @@ openenv push --repo-id your-org/pyre-env
 
 ```
 pyre_env/
-├── models.py                       PyreAction, PyreObservation, PyreState
+├── models.py                       PyreAction, PyreObservation, PyreMapState, PyreState
 ├── client.py                       PyreEnv (EnvClient subclass)
 ├── openenv.yaml                    OpenEnv manifest
 ├── pyproject.toml
@@ -141,18 +145,16 @@ pyre_env/
 │   ├── app.py                      FastAPI bootstrap
 │   ├── pyre_env_environment.py     Main Environment class
 │   ├── floor_plan.py               3 building templates + episode generation
-│   ├── fire_sim.py                 Cellular automaton fire/smoke
-│   ├── npc_model.py                NPC state machine + stampede detection
-│   ├── narrative.py                Visibility + text observation renderer
-│   └── rubrics.py                  13 composable reward components
+│   ├── fire_sim.py                 Cellular automaton fire/smoke simulation
+│   ├── narrative.py                Visibility + first-person text observation renderer
+│   └── rubrics.py                  8 composable reward components
 └── examples/
-    ├── random_agent.py             Smoke-test baseline
-    └── pyre_grpo_training.ipynb    GRPO training notebook (TRL + Unsloth)
+    └── random_agent.py             Smoke-test baseline
 ```
 
 ---
 
 ## Hackathon alignment
 
-- **Theme #2 — Long-Horizon Planning**: 50–150 step episodes; agent must build a mental map across many observations
-- **Theme #3.1 — World Modeling**: no global map; agent infers fire spread, NPC locations, and corridor topology from local text observations
+- **Theme #2 — Long-Horizon Planning**: 50–200 step episodes; agent must build a mental map across many partial observations
+- **Theme #3.1 — World Modeling**: no global map; agent infers fire spread, corridor topology, and exit reachability from local text observations alone
