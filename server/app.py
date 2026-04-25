@@ -1,84 +1,43 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+"""FastAPI application for the Pyre Environment.
 
-"""
-FastAPI application for the Pyre Env Environment.
+Uses a factory function so each WebSocket session gets an isolated environment instance.
 
-This module creates an HTTP server that exposes the PyreEnvironment
-over HTTP and WebSocket endpoints, compatible with EnvClient.
-
-Endpoints:
-    - POST /reset: Reset the environment
-    - POST /step: Execute an action
-    - GET /state: Get current environment state
-    - GET /schema: Get action/observation schemas
-    - WS /ws: WebSocket endpoint for persistent sessions
-
-Usage:
-    # Development (with auto-reload):
-    uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
-
-    # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
-
-    # Or run directly:
-    python -m server.app
+Configuration via environment variables:
+  PYRE_NPC_COUNT   number of NPCs per episode (default 10)
+  PYRE_MAX_STEPS   max steps before timeout (default 150)
+  PYRE_SEED        base random seed (default 42)
+  PORT             server port (default 8000)
 """
 
-try:
-    from openenv.core.env_server.http_server import create_app
-except Exception as e:  # pragma: no cover
-    raise ImportError(
-        "openenv is required for the web interface. Install dependencies with '\n    uv sync\n'"
-    ) from e
+import os
 
-try:
-    from ..models import PyreAction, PyreObservation
-    from .pyre_env_environment import PyreEnvironment
-except ModuleNotFoundError:
-    from models import PyreAction, PyreObservation
-    from server.pyre_env_environment import PyreEnvironment
+from openenv.core.env_server.http_server import create_app
+
+from ..models import PyreAction, PyreObservation
+from .pyre_env_environment import PyreEnvironment
+
+NPC_COUNT = int(os.getenv("PYRE_NPC_COUNT", "10"))
+MAX_STEPS = int(os.getenv("PYRE_MAX_STEPS", "150"))
+BASE_SEED = int(os.getenv("PYRE_SEED", "42"))
 
 
-# Create the app with web interface and README integration
+def create_pyre_environment() -> PyreEnvironment:
+    return PyreEnvironment(npc_count=NPC_COUNT, max_steps=MAX_STEPS, base_seed=BASE_SEED)
+
+
 app = create_app(
-    PyreEnvironment,
+    create_pyre_environment,
     PyreAction,
     PyreObservation,
     env_name="pyre_env",
-    max_concurrent_envs=1,  # increase this number to allow more concurrent WebSocket sessions
 )
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution via uv run or python -m.
-
-    This function enables running the server without Docker:
-        uv run --project . server
-        uv run --project . server --port 8001
-        python -m pyre_env.server.app
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-
-    For production deployments, consider using uvicorn directly with
-    multiple workers:
-        uvicorn pyre_env.server.app:app --workers 4
-    """
     import uvicorn
-
+    port = int(os.getenv("PORT", port))
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=8000)
-    args = parser.parse_args()
-    main(port=args.port)
+    main()

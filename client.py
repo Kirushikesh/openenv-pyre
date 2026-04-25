@@ -1,99 +1,53 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""Pyre Env Environment Client."""
+"""Pyre Environment Client."""
 
 from typing import Dict
 
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
-from openenv.core.env_server.types import State
 
-from .models import PyreAction, PyreObservation
+from .models import PyreAction, PyreObservation, PyreState
 
 
-class PyreEnv(
-    EnvClient[PyreAction, PyreObservation, State]
-):
-    """
-    Client for the Pyre Env Environment.
+class PyreEnv(EnvClient[PyreAction, PyreObservation, PyreState]):
+    """Client for the Pyre Environment.
 
-    This client maintains a persistent WebSocket connection to the environment server,
-    enabling efficient multi-step interactions with lower latency.
-    Each client instance has its own dedicated environment session on the server.
+    Maintains a persistent WebSocket connection to the environment server.
+    Each instance has its own isolated episode.
 
     Example:
-        >>> # Connect to a running server
-        >>> with PyreEnv(base_url="http://localhost:8000") as client:
-        ...     result = client.reset()
-        ...     print(result.observation.echoed_message)
-        ...
-        ...     result = client.step(PyreAction(message="Hello!"))
-        ...     print(result.observation.echoed_message)
-
-    Example with Docker:
-        >>> # Automatically start container and connect
-        >>> client = PyreEnv.from_docker_image("pyre_env-env:latest")
-        >>> try:
-        ...     result = client.reset()
-        ...     result = client.step(PyreAction(message="Test"))
-        ... finally:
-        ...     client.close()
+        >>> with PyreEnv(base_url="http://localhost:8000") as env:
+        ...     result = env.reset()
+        ...     print(result.observation.narrative)
+        ...     result = env.step(PyreAction(action="move", direction="north"))
+        ...     print(result.observation.narrative)
     """
 
     def _step_payload(self, action: PyreAction) -> Dict:
-        """
-        Convert PyreAction to JSON payload for step message.
-
-        Args:
-            action: PyreAction instance
-
-        Returns:
-            Dictionary representation suitable for JSON encoding
-        """
-        return {
-            "message": action.message,
-        }
+        return action.model_dump(exclude_none=True)
 
     def _parse_result(self, payload: Dict) -> StepResult[PyreObservation]:
-        """
-        Parse server response into StepResult[PyreObservation].
-
-        Args:
-            payload: JSON response data from server
-
-        Returns:
-            StepResult with PyreObservation
-        """
-        obs_data = payload.get("observation", {})
-        observation = PyreObservation(
-            echoed_message=obs_data.get("echoed_message", ""),
-            message_length=obs_data.get("message_length", 0),
+        obs_data = payload.get("observation", payload)
+        obs = PyreObservation(
+            narrative=obs_data.get("narrative", ""),
+            location_label=obs_data.get("location_label", ""),
+            smoke_level=obs_data.get("smoke_level", "none"),
+            fire_visible=obs_data.get("fire_visible", False),
+            fire_direction=obs_data.get("fire_direction"),
+            visible_people=obs_data.get("visible_people", []),
+            visible_objects=obs_data.get("visible_objects", []),
+            audible_signals=obs_data.get("audible_signals", []),
+            elapsed_steps=obs_data.get("elapsed_steps", 0),
+            last_action_feedback=obs_data.get("last_action_feedback", ""),
+            available_actions_hint=obs_data.get("available_actions_hint", []),
             done=payload.get("done", False),
-            reward=payload.get("reward"),
-            metadata=obs_data.get("metadata", {}),
+            reward=payload.get("reward", 0.0),
+            metadata=payload.get("metadata", {}),
         )
-
         return StepResult(
-            observation=observation,
+            observation=obs,
             reward=payload.get("reward"),
             done=payload.get("done", False),
         )
 
-    def _parse_state(self, payload: Dict) -> State:
-        """
-        Parse server response into State object.
-
-        Args:
-            payload: JSON response from state request
-
-        Returns:
-            State object with episode_id and step_count
-        """
-        return State(
-            episode_id=payload.get("episode_id"),
-            step_count=payload.get("step_count", 0),
-        )
+    def _parse_state(self, payload: Dict) -> PyreState:
+        return PyreState(**payload)

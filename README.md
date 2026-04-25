@@ -1,8 +1,8 @@
 ---
-title: Pyre Env Environment Server
-emoji: 📯
-colorFrom: pink
-colorTo: purple
+title: Pyre — Crisis Navigation Environment
+emoji: 🔥
+colorFrom: red
+colorTo: orange
 sdk: docker
 pinned: false
 app_port: 8000
@@ -11,245 +11,148 @@ tags:
   - openenv
 ---
 
-# Pyre Env Environment
+# Pyre — Crisis Navigation Environment for LLM Agents
 
-A simple test environment that echoes back messages. Perfect for testing the env APIs as well as demonstrating environment usage patterns.
+> *When buildings burn, the difference between a safe evacuation and a tragedy is the quality of decisions made in the first 60 seconds. Can we train an LLM to be the right kind of guide?*
 
-## Quick Start
+**Pyre** places an LLM agent *inside* a burning building. The agent must navigate to safety while simultaneously coordinating nearby civilians toward exits, managing fire spread through door control, and reasoning under partial observability — all with no global map and hard time pressure.
 
-The simplest way to use the Pyre Env environment is through the `PyreEnv` class:
+---
 
-```python
-from pyre_env import PyreAction, PyreEnv
+## Why Pyre vs. existing environments
 
-try:
-    # Create environment from Docker image
-    pyre_envenv = PyreEnv.from_docker_image("pyre_env-env:latest")
+| Feature | `grid_world` | `maze_env` | `wildfire_env` | **Pyre** |
+|---|---|---|---|---|
+| Observability | Full | Full | Partial | **Partial, first-person, text** |
+| Map dynamics | Static | Static | Dynamic (fire) | **Dynamic (fire + doors + crowd)** |
+| Other entities | None | None | Few | **Many NPCs with behavior model** |
+| Action richness | 4 moves | 4 moves | Suppression | **Movement + door control + speech acts** |
+| Agent role | Mover | Mover | Suppressor | **Coordinator + survivor** |
+| Reward complexity | Reach goal | Reach goal | Suppress fire | **13-component composite rubric** |
 
-    # Reset
-    result = pyre_envenv.reset()
-    print(f"Reset: {result.observation.echoed_message}")
+*`wildfire_env` trains an agent to fight fires from above; Pyre trains an agent to survive and lead others out from inside.*
 
-    # Send multiple messages
-    messages = ["Hello, World!", "Testing echo", "Final message"]
+---
 
-    for msg in messages:
-        result = pyre_envenv.step(PyreAction(message=msg))
-        print(f"Sent: '{msg}'")
-        print(f"  → Echoed: '{result.observation.echoed_message}'")
-        print(f"  → Length: {result.observation.message_length}")
-        print(f"  → Reward: {result.reward}")
+## What the agent sees (narrative observation)
 
-finally:
-    # Always clean up
-    pyre_envenv.close()
+Every step the agent receives a first-person text observation:
+
+```
+You are in the **main_corridor**. The air is **moderate**.
+Flames are visible to the **east**.
+3 people nearby: p_3 (panicked) is 2m north, p_7 (calm) is 3m west, p_1 (injured) is 1m east.
+Exit visible: exit at 8m west.
+Doors: door_2 (closed) at 2m east.
+You hear: Fire alarm sounding; Screaming from nearby.
+Last action: You move south. The smoke is thick here.
+Available actions: move(direction='north')  move(direction='west')  close_door(target_id='door_2')  instruct(target_id='p_3', direction='west')  wait()
 ```
 
-That's it! The `PyreEnv.from_docker_image()` method handles:
-- Starting the Docker container
-- Waiting for the server to be ready
-- Connecting to the environment
-- Container cleanup when you call `close()`
+---
 
-## Building the Docker Image
+## Action space
 
-Before using the environment, you need to build the Docker image:
+| Action | Parameters | Effect |
+|---|---|---|
+| `move` | `direction` | Move one cell N/S/E/W |
+| `instruct` | `target_id`, `direction` | Direct nearby NPC (compliance depends on NPC state) |
+| `close_door` | `target_id` | Close door — slows fire 7× but may trap NPCs |
+| `open_door` | `target_id` | Open a closed door |
+| `broadcast` | `zone`, `category` | Instruct all NPCs in a zone at once |
+| `wait` | — | Skip turn |
+
+---
+
+## Reward function (composite rubric)
+
+**Per step:**
+- `-0.01` constant time penalty
+- `+0.1` moved closer to exit
+- `-0.5` moved into heavy smoke or fire-adjacent cell
+- `+0.2` issued instruction an NPC followed toward exit
+- `-0.05` issued instruction no one followed
+- `+0.5` closed door adjacent to active fire (strategic)
+- `-2.0` closed door that later trapped a casualty NPC
+
+**Episode end:**
+- `+5.0` agent evacuated alive
+- `-10.0` agent incapacitated
+- `+1.0 × N` per NPC evacuated
+- `-2.0 × N` per NPC casualty
+- `+3.0` no stampede occurred
+- `-1.5 × N` per stampede event
+
+---
+
+## Quick start
 
 ```bash
-# From project root
-docker build -t pyre_env-env:latest -f server/Dockerfile .
+cd pyre_env
+uv sync
+uv run server   # → http://localhost:8000
+
+# Health check
+curl http://localhost:8000/health
+
+# Reset
+curl -X POST http://localhost:8000/reset
+
+# Step
+curl -X POST http://localhost:8000/step \
+  -H "Content-Type: application/json" \
+  -d '{"action": "move", "direction": "north"}'
+
+# Random baseline (5 episodes)
+python examples/random_agent.py --episodes 5 --verbose
 ```
 
-## Deploying to Hugging Face Spaces
-
-You can easily deploy your OpenEnv environment to Hugging Face Spaces using the `openenv push` command:
-
-```bash
-# From the environment directory (where openenv.yaml is located)
-openenv push
-
-# Or specify options
-openenv push --namespace my-org --private
-```
-
-The `openenv push` command will:
-1. Validate that the directory is an OpenEnv environment (checks for `openenv.yaml`)
-2. Prepare a custom build for Hugging Face Docker space (enables web interface)
-3. Upload to Hugging Face (ensuring you're logged in)
-
-### Prerequisites
-
-- Authenticate with Hugging Face: The command will prompt for login if not already authenticated
-
-### Options
-
-- `--directory`, `-d`: Directory containing the OpenEnv environment (defaults to current directory)
-- `--repo-id`, `-r`: Repository ID in format 'username/repo-name' (defaults to 'username/env-name' from openenv.yaml)
-- `--base-image`, `-b`: Base Docker image to use (overrides Dockerfile FROM)
-- `--private`: Deploy the space as private (default: public)
-
-### Examples
-
-```bash
-# Push to your personal namespace (defaults to username/env-name from openenv.yaml)
-openenv push
-
-# Push to a specific repository
-openenv push --repo-id my-org/my-env
-
-# Push with a custom base image
-openenv push --base-image ghcr.io/meta-pytorch/openenv-base:latest
-
-# Push as a private space
-openenv push --private
-
-# Combine options
-openenv push --repo-id my-org/my-env --base-image custom-base:latest --private
-```
-
-After deployment, your space will be available at:
-`https://huggingface.co/spaces/<repo-id>`
-
-The deployed space includes:
-- **Web Interface** at `/web` - Interactive UI for exploring the environment
-- **API Documentation** at `/docs` - Full OpenAPI/Swagger interface
-- **Health Check** at `/health` - Container health monitoring
-- **WebSocket** at `/ws` - Persistent session endpoint for low-latency interactions
-
-## Environment Details
-
-### Action
-**PyreAction**: Contains a single field
-- `message` (str) - The message to echo back
-
-### Observation
-**PyreObservation**: Contains the echo response and metadata
-- `echoed_message` (str) - The message echoed back
-- `message_length` (int) - Length of the message
-- `reward` (float) - Reward based on message length (length × 0.1)
-- `done` (bool) - Always False for echo environment
-- `metadata` (dict) - Additional info like step count
-
-### Reward
-The reward is calculated as: `message_length × 0.1`
-- "Hi" → reward: 0.2
-- "Hello, World!" → reward: 1.3
-- Empty message → reward: 0.0
-
-## Advanced Usage
-
-### Connecting to an Existing Server
-
-If you already have a Pyre Env environment server running, you can connect directly:
+### Python client
 
 ```python
-from pyre_env import PyreEnv
+from pyre_env import PyreEnv, PyreAction
 
-# Connect to existing server
-pyre_envenv = PyreEnv(base_url="<ENV_HTTP_URL_HERE>")
-
-# Use as normal
-result = pyre_envenv.reset()
-result = pyre_envenv.step(PyreAction(message="Hello!"))
-```
-
-Note: When connecting to an existing server, `pyre_envenv.close()` will NOT stop the server.
-
-### Using the Context Manager
-
-The client supports context manager usage for automatic connection management:
-
-```python
-from pyre_env import PyreAction, PyreEnv
-
-# Connect with context manager (auto-connects and closes)
 with PyreEnv(base_url="http://localhost:8000") as env:
     result = env.reset()
-    print(f"Reset: {result.observation.echoed_message}")
-    # Multiple steps with low latency
-    for msg in ["Hello", "World", "!"]:
-        result = env.step(PyreAction(message=msg))
-        print(f"Echoed: {result.observation.echoed_message}")
+    print(result.observation.narrative)
+    result = env.step(PyreAction(action="move", direction="north"))
+    print(f"Reward: {result.reward}")
 ```
 
-The client uses WebSocket connections for:
-- **Lower latency**: No HTTP connection overhead per request
-- **Persistent session**: Server maintains your environment state
-- **Efficient for episodes**: Better for many sequential steps
+---
 
-### Concurrent WebSocket Sessions
-
-The server supports multiple concurrent WebSocket connections. To enable this,
-modify `server/app.py` to use factory mode:
-
-```python
-# In server/app.py - use factory mode for concurrent sessions
-app = create_app(
-    PyreEnvironment,  # Pass class, not instance
-    PyreAction,
-    PyreObservation,
-    max_concurrent_envs=4,  # Allow 4 concurrent sessions
-)
-```
-
-Then multiple clients can connect simultaneously:
-
-```python
-from pyre_env import PyreAction, PyreEnv
-from concurrent.futures import ThreadPoolExecutor
-
-def run_episode(client_id: int):
-    with PyreEnv(base_url="http://localhost:8000") as env:
-        result = env.reset()
-        for i in range(10):
-            result = env.step(PyreAction(message=f"Client {client_id}, step {i}"))
-        return client_id, result.observation.message_length
-
-# Run 4 episodes concurrently
-with ThreadPoolExecutor(max_workers=4) as executor:
-    results = list(executor.map(run_episode, range(4)))
-```
-
-## Development & Testing
-
-### Direct Environment Testing
-
-Test the environment logic directly without starting the HTTP server:
+## Deployment
 
 ```bash
-# From the server directory
-python3 server/pyre_env_environment.py
+openenv push --repo-id your-org/pyre-env
 ```
 
-This verifies that:
-- Environment resets correctly
-- Step executes actions properly
-- State tracking works
-- Rewards are calculated correctly
+---
 
-### Running Locally
-
-Run the server locally for development:
-
-```bash
-uvicorn server.app:app --reload
-```
-
-## Project Structure
+## Project structure
 
 ```
 pyre_env/
-├── .dockerignore         # Docker build exclusions
-├── __init__.py            # Module exports
-├── README.md              # This file
-├── openenv.yaml           # OpenEnv manifest
-├── pyproject.toml         # Project metadata and dependencies
-├── uv.lock                # Locked dependencies (generated)
-├── client.py              # PyreEnv client
-├── models.py              # Action and Observation models
-└── server/
-    ├── __init__.py        # Server module exports
-    ├── pyre_env_environment.py  # Core environment logic
-    ├── app.py             # FastAPI application (HTTP + WebSocket endpoints)
-    └── Dockerfile         # Container image definition
+├── models.py                       PyreAction, PyreObservation, PyreState
+├── client.py                       PyreEnv (EnvClient subclass)
+├── openenv.yaml                    OpenEnv manifest
+├── pyproject.toml
+├── server/
+│   ├── app.py                      FastAPI bootstrap
+│   ├── pyre_env_environment.py     Main Environment class
+│   ├── floor_plan.py               3 building templates + episode generation
+│   ├── fire_sim.py                 Cellular automaton fire/smoke
+│   ├── npc_model.py                NPC state machine + stampede detection
+│   ├── narrative.py                Visibility + text observation renderer
+│   └── rubrics.py                  13 composable reward components
+└── examples/
+    ├── random_agent.py             Smoke-test baseline
+    └── pyre_grpo_training.ipynb    GRPO training notebook (TRL + Unsloth)
 ```
+
+---
+
+## Hackathon alignment
+
+- **Theme #2 — Long-Horizon Planning**: 50–150 step episodes; agent must build a mental map across many observations
+- **Theme #3.1 — World Modeling**: no global map; agent infers fire spread, NPC locations, and corridor topology from local text observations

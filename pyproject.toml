@@ -9,23 +9,16 @@ requires = ["setuptools>=45", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openenv-pyre_env"
+name = "openenv-pyre-env"
 version = "0.1.0"
-description = "Pyre Env environment for OpenEnv"
+description = "Pyre — first-person crisis navigation environment for LLM agent RL training"
 requires-python = ">=3.10"
 dependencies = [
-    # Core OpenEnv runtime (provides FastAPI server + HTTP client types)
-    # install from github
-    # "openenv-core[core] @ git+https://github.com/meta-pytorch/OpenEnv.git",
     "openenv-core[core]>=0.2.2",
-    # Environment-specific dependencies
-    # Add all dependencies needed for your environment here
-    # Examples:
-    # "numpy>=1.19.0",
-    # "torch>=2.0.0",
-    # "gymnasium>=0.29.0",
-    # "openspiel>=1.0.0",
-    # "smolagents>=1.22.0,<2",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "uvicorn[standard]>=0.24.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
