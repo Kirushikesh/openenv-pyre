@@ -34,7 +34,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openenv.core.env_server.interfaces import Environment
 
-from ..models import PyreAction, PyreMapState, PyreObservation, PyreState
+try:
+    from ..models import PyreAction, PyreMapState, PyreObservation, PyreState
+except (ImportError, ModuleNotFoundError):
+    from models import PyreAction, PyreMapState, PyreObservation, PyreState
 from .fire_sim import FireSim, FIRE_BURNING, smoke_level_label, WIND_DIRS
 from .floor_plan import generate_episode, generate_procedural_floor_plan, template_names
 from .narrative import build_look_result, build_narrative_observation, compute_visible_cells
