@@ -1246,7 +1246,7 @@ function buildStepCurl() {
   const action = lastActionSent || { action: 'wait' };
   const payload = { action };
   const json = JSON.stringify(payload).replace(/"/g, '\\"');
-  return `curl -X POST "http://127.0.0.1:8001/step" -H "Content-Type: application/json" -d "${json}"`;
+  return `curl -X POST "http://127.0.0.1:8000/step" -H "Content-Type: application/json" -d "${json}"`;
 }
 
 function setStatus(text, isError = false) {
