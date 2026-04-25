@@ -279,13 +279,16 @@ def _build_action_hints(
 ) -> List[str]:
     hints: List[str] = []
 
-    # Movement
+    # Movement and look hints per direction
     for dx, dy, dirname in _CARDINAL:
         nx, ny = ax + dx, ay + dy
         if _in_bounds(nx, ny, w, h):
             ct = cell_grid[_idx(nx, ny, w)]
             if ct in (FLOOR, DOOR_OPEN, EXIT):
                 hints.append(f"move(direction='{dirname}')")
+            # Suggest look for any non-wall direction (including closed doors/obstacles)
+            if ct != WALL:
+                hints.append(f"look(direction='{dirname}')")
 
     # Door actions
     for obj in visible_objects:
@@ -368,6 +371,95 @@ def _health_bar(health: float) -> str:
     filled = int(health / 10)
     empty = 10 - filled
     return "█" * filled + "░" * empty + f" {int(health)}/100"
+
+
+# ---------------------------------------------------------------------------
+# Look action support
+# ---------------------------------------------------------------------------
+
+def build_look_result(
+    direction: str,
+    agent_x: int,
+    agent_y: int,
+    cell_grid: List[int],
+    fire_grid: List[float],
+    smoke_grid: List[float],
+    zone_map: Dict[str, str],
+    door_registry: Dict[str, List[int]],
+    w: int,
+    h: int,
+) -> str:
+    """Generate a detailed description of cells in one cardinal direction.
+
+    Scans up to 5 cells from the agent's position in `direction`, stopping
+    at the first wall or out-of-bounds cell. Returns a sentence describing
+    each visible cell — smoke level, fire presence, door/exit status, zone.
+    """
+    delta = {
+        "north": (0, -1), "south": (0, 1),
+        "west": (-1, 0),  "east":  (1, 0),
+    }.get(direction)
+    if delta is None:
+        return f"Unknown direction '{direction}'."
+
+    dx, dy = delta
+    door_pos_to_id = {(v[0], v[1]): k for k, v in door_registry.items()}
+    lines = [f"Looking **{direction}**:"]
+    nothing_visible = True
+
+    for dist in range(1, 6):
+        nx, ny = agent_x + dx * dist, agent_y + dy * dist
+        if not _in_bounds(nx, ny, w, h):
+            lines.append(f"  {dist}m — outer wall.")
+            break
+
+        ct = cell_grid[_idx(nx, ny, w)]
+        if ct == WALL:
+            lines.append(f"  {dist}m — wall.")
+            break
+
+        nothing_visible = False
+        parts: List[str] = []
+
+        # Cell type label
+        if ct == EXIT:
+            fire_at = fire_grid[_idx(nx, ny, w)]
+            status = "BLOCKED by fire" if fire_at >= EXIT_BLOCKED_FIRE_THRESHOLD else "clear"
+            parts.append(f"**EXIT** ({status})")
+        elif ct == DOOR_OPEN:
+            door_id = door_pos_to_id.get((nx, ny), "door")
+            parts.append(f"open door [{door_id}]")
+        elif ct == DOOR_CLOSED:
+            door_id = door_pos_to_id.get((nx, ny), "door")
+            parts.append(f"closed door [{door_id}]")
+        elif ct == OBSTACLE:
+            parts.append("burnt rubble (impassable)")
+        else:
+            zone = zone_map.get(f"{nx},{ny}", "")
+            if zone:
+                parts.append(zone.replace("_", " "))
+            else:
+                parts.append("open floor")
+
+        # Smoke
+        smoke = smoke_grid[_idx(nx, ny, w)]
+        s_label = smoke_level_label(smoke)
+        if s_label != "none":
+            parts.append(f"**{s_label} smoke**")
+
+        # Fire
+        fire = fire_grid[_idx(nx, ny, w)]
+        if fire >= FIRE_BURNING:
+            parts.append("**actively burning**")
+        elif fire > 0.1:
+            parts.append("smoldering heat")
+
+        lines.append(f"  {dist}m — {', '.join(parts)}.")
+
+    if nothing_visible:
+        lines.append("  Nothing visible in this direction.")
+
+    return "\n".join(lines)
 
 
 def _terminal_obs(

@@ -6,7 +6,7 @@ The environment composes them by calling each rubric each step.
 
 Per-step rubrics:
   TimeStepPenalty          -0.01      constant time pressure
-  ProgressReward           +0.1       agent moved closer to nearest unblocked exit
+  ProgressReward           +0.1       agent moved closer to nearest unblocked exit (BFS distance)
   DangerPenalty            -0.5       agent moved into smoke≥moderate or fire-adjacent cell
   HealthDrainPenalty       -0.02×dmg  proportional to health lost this step
   StrategicDoorBonus       +0.5       closed a door that meaningfully slows active fire
@@ -17,6 +17,7 @@ Episode-end rubrics:
   TimeBonus                +0.05×rem  reward for finishing quickly (remaining steps)
 """
 
+from collections import deque
 from typing import Any, Dict, List, Optional
 
 from .fire_sim import EXIT_BLOCKED_FIRE_THRESHOLD, FIRE_BURNING
@@ -27,15 +28,7 @@ OBSTACLE = 5
 DOOR_CLOSED = 3
 SMOKE_MODERATE = 0.5
 
-
-def _manhattan(x1: int, y1: int, x2: int, y2: int) -> int:
-    return abs(x1 - x2) + abs(y1 - y2)
-
-
-def _nearest_exit_dist(x: int, y: int, exits: List[List[int]]) -> int:
-    if not exits:
-        return 9999
-    return min(_manhattan(x, y, ex[0], ex[1]) for ex in exits)
+_BFS_INF = 9999
 
 
 def _unblocked_exits(exit_positions: List[List[int]], fire_grid: List[float], w: int) -> List[List[int]]:
@@ -44,6 +37,50 @@ def _unblocked_exits(exit_positions: List[List[int]], fire_grid: List[float], w:
         ex for ex in exit_positions
         if fire_grid[ex[1] * w + ex[0]] < EXIT_BLOCKED_FIRE_THRESHOLD
     ]
+
+
+def _bfs_exit_dist(
+    x: int,
+    y: int,
+    exits: List[List[int]],
+    cell_grid: List[int],
+    w: int,
+    h: int,
+) -> int:
+    """BFS traversal distance from (x, y) to the nearest reachable exit.
+
+    Walls (1) and obstacles (5) block movement. Closed doors (3) are treated
+    as passable — the agent can open them en route. Returns _BFS_INF when no
+    exit is reachable (all paths wall-blocked).
+    """
+    if not exits:
+        return _BFS_INF
+
+    exit_set = {(ex[0], ex[1]) for ex in exits}
+    if (x, y) in exit_set:
+        return 0
+
+    visited = {(x, y)}
+    queue: deque = deque()
+    queue.append((x, y, 0))
+
+    while queue:
+        cx, cy, dist = queue.popleft()
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < w and 0 <= ny < h):
+                continue
+            if (nx, ny) in visited:
+                continue
+            ct = cell_grid[ny * w + nx]
+            if ct in (WALL, OBSTACLE):
+                continue
+            if (nx, ny) in exit_set:
+                return dist + 1
+            visited.add((nx, ny))
+            queue.append((nx, ny, dist + 1))
+
+    return _BFS_INF
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +95,11 @@ class TimeStepPenalty:
 
 
 class ProgressReward:
-    """Reward agent for moving strictly closer to the nearest unblocked exit."""
+    """Reward agent for moving strictly closer to the nearest unblocked exit.
+
+    Uses BFS traversal distance (respects walls and obstacles) instead of
+    Manhattan distance, so only genuine navigational progress is rewarded.
+    """
 
     def score(
         self,
@@ -66,7 +107,8 @@ class ProgressReward:
         agent_x: int, agent_y: int,
         exit_positions: List[List[int]],
         fire_grid: List[float],
-        w: int,
+        cell_grid: List[int],
+        w: int, h: int,
         action: str,
         **_,
     ) -> float:
@@ -75,8 +117,8 @@ class ProgressReward:
         exits = _unblocked_exits(exit_positions, fire_grid, w)
         if not exits:
             exits = exit_positions  # all blocked — still try to reward progress
-        prev_dist = _nearest_exit_dist(prev_agent_x, prev_agent_y, exits)
-        new_dist = _nearest_exit_dist(agent_x, agent_y, exits)
+        prev_dist = _bfs_exit_dist(prev_agent_x, prev_agent_y, exits, cell_grid, w, h)
+        new_dist = _bfs_exit_dist(agent_x, agent_y, exits, cell_grid, w, h)
         return 0.1 if new_dist < prev_dist else 0.0
 
 

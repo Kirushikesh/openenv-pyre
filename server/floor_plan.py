@@ -9,6 +9,14 @@ Three 16×16 hand-authored building templates:
 Cell encoding:
   0 = floor       1 = wall        2 = door_open
   3 = door_closed 4 = exit        5 = obstacle
+
+fuel_map (per cell, float):
+  Controls how fast fire ignites and intensifies in each cell.
+  0.0 = no fuel (walls/obstacles)  1.0 = baseline  1.5 = high fuel (offices/rooms)
+
+ventilation_map (per cell, float):
+  Smoke decay rate per step for each cell. Higher = smoke clears faster.
+  Open areas ventilate faster than enclosed rooms.
 """
 
 import random
@@ -31,7 +39,73 @@ class FloorPlan:
     spawn_zones: List[Tuple[int, int]]      # valid NPC spawn cells
     agent_spawn_options: List[Tuple[int, int]]
     zone_map: Dict[str, str]                # "{x},{y}" → zone_label
-    fire_min_exit_dist: int = 5            # fire ignition at least this far from any exit
+    fire_min_exit_dist: int = 5             # fire ignition at least this far from any exit
+    fuel_map: List[float] = field(default_factory=list)         # fire fuel per cell
+    ventilation_map: List[float] = field(default_factory=list)  # smoke decay per cell
+
+
+# ---------------------------------------------------------------------------
+# Fuel and ventilation helpers
+# ---------------------------------------------------------------------------
+
+# Fuel factor by zone label
+_FUEL_BY_ZONE = {
+    "north_offices":   1.5,   # paper, wooden furniture
+    "south_offices":   1.5,
+    "west_rooms":      1.5,
+    "east_rooms":      1.5,
+    "north_wing":      1.0,
+    "south_wing":      1.0,
+    "main_corridor":   1.0,
+    "northwest_hall":  0.9,
+    "northeast_hall":  0.9,
+    "southwest_hall":  0.9,
+    "southeast_hall":  0.9,
+    "exit":            0.6,   # tile/concrete near exits
+}
+_FUEL_DEFAULT = 1.0
+_FUEL_IMPASSABLE = 0.0  # walls and obstacles cannot burn
+
+# Ventilation (smoke decay rate) by zone label
+_VENT_BY_ZONE = {
+    "main_corridor":   0.028,
+    "north_wing":      0.025,
+    "south_wing":      0.025,
+    "northwest_hall":  0.050,  # large open plan — strong airflow
+    "northeast_hall":  0.050,
+    "southwest_hall":  0.050,
+    "southeast_hall":  0.050,
+    "north_offices":   0.010,  # enclosed rooms — smoke builds up
+    "south_offices":   0.010,
+    "west_rooms":      0.010,
+    "east_rooms":      0.010,
+    "exit":            0.040,  # exit gaps allow venting
+}
+_VENT_DEFAULT = 0.020
+_VENT_IMPASSABLE = 0.0
+
+
+def _build_fuel_and_ventilation(
+    grid: List[int],
+    zone_map: Dict[str, str],
+    w: int,
+    h: int,
+) -> tuple[List[float], List[float]]:
+    """Derive fuel_map and ventilation_map from zone labels and cell types."""
+    fuel = []
+    vent = []
+    for y in range(h):
+        for x in range(w):
+            i = y * w + x
+            ct = grid[i]
+            if ct in (1, 5):   # wall or obstacle
+                fuel.append(_FUEL_IMPASSABLE)
+                vent.append(_VENT_IMPASSABLE)
+            else:
+                zone = zone_map.get(f"{x},{y}", "")
+                fuel.append(_FUEL_BY_ZONE.get(zone, _FUEL_DEFAULT))
+                vent.append(_VENT_BY_ZONE.get(zone, _VENT_DEFAULT))
+    return fuel, vent
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +196,8 @@ def _make_small_office() -> FloorPlan:
             elif ct == 4:
                 zone_map[f"{x},{y}"] = "exit"
 
+    fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
+
     return FloorPlan(
         name="small_office",
         cell_grid=grid,
@@ -132,6 +208,8 @@ def _make_small_office() -> FloorPlan:
         agent_spawn_options=corridor_cells,
         zone_map=zone_map,
         fire_min_exit_dist=5,
+        fuel_map=fuel_map,
+        ventilation_map=ventilation_map,
     )
 
 
@@ -196,6 +274,8 @@ def _make_open_plan() -> FloorPlan:
             elif ct == 4:
                 zone_map[f"{x},{y}"] = "exit"
 
+    fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
+
     return FloorPlan(
         name="open_plan",
         cell_grid=grid,
@@ -206,6 +286,8 @@ def _make_open_plan() -> FloorPlan:
         agent_spawn_options=floor_cells,
         zone_map=zone_map,
         fire_min_exit_dist=4,
+        fuel_map=fuel_map,
+        ventilation_map=ventilation_map,
     )
 
 
@@ -278,6 +360,8 @@ def _make_t_corridor() -> FloorPlan:
             elif ct == 4:
                 zone_map[f"{x},{y}"] = "exit"
 
+    fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
+
     return FloorPlan(
         name="t_corridor",
         cell_grid=grid,
@@ -288,6 +372,8 @@ def _make_t_corridor() -> FloorPlan:
         agent_spawn_options=agent_spawn,
         zone_map=zone_map,
         fire_min_exit_dist=4,
+        fuel_map=fuel_map,
+        ventilation_map=ventilation_map,
     )
 
 
@@ -349,6 +435,8 @@ def generate_episode(
         agent_spawn_options=fp.agent_spawn_options,
         zone_map=fp.zone_map,
         fire_min_exit_dist=fp.fire_min_exit_dist,
+        fuel_map=fp.fuel_map[:],
+        ventilation_map=fp.ventilation_map[:],
     )
 
     # Agent start

@@ -9,12 +9,17 @@ Orchestrates:
 
 Per-episode randomization (makes each episode unique):
   - Template selected in rotation
-  - Number of fire ignition sources: 2–4
-  - Fire spread rate: 0.15–0.40
-  - Wind direction: random from 9 directions (N/NE/E/SE/S/SW/W/NW/CALM)
-  - Humidity: 0.10–0.45
+  - Number of fire ignition sources: varies by difficulty
+  - Fire spread rate: varies by difficulty
+  - Wind direction: varies by difficulty
+  - Humidity: varies by difficulty
   - Agent spawn position: random from template spawn options
   - Fire start positions: random floor cells far from exits and agent
+
+Difficulty levels (set via the `difficulty` param in /reset):
+  easy   — 1 source, slow spread, CALM wind, high humidity, 200 max steps
+  medium — 2–4 sources, moderate spread, any wind, moderate humidity, 150 steps (default)
+  hard   — 3–5 sources, fast spread, always windy, low humidity, 100 steps
 
 Done conditions:
   - Agent evacuated through an unblocked exit → success
@@ -32,7 +37,7 @@ from openenv.core.env_server.interfaces import Environment
 from ..models import PyreAction, PyreMapState, PyreObservation, PyreState
 from .fire_sim import FireSim, FIRE_BURNING, smoke_level_label, WIND_DIRS
 from .floor_plan import generate_episode, template_names
-from .narrative import build_narrative_observation, compute_visible_cells
+from .narrative import build_look_result, build_narrative_observation, compute_visible_cells
 from .rubrics import make_per_step_rubrics, make_episode_end_rubrics
 
 # Cell type constants
@@ -53,6 +58,34 @@ DAMAGE_LIGHT_SMOKE = 0.5
 DAMAGE_MODERATE_SMOKE = 2.0
 DAMAGE_HEAVY_SMOKE = 5.0
 DAMAGE_ON_FIRE = 10.0
+
+# ---------------------------------------------------------------------------
+# Difficulty presets — override fire randomisation ranges per episode
+# ---------------------------------------------------------------------------
+# Each preset is a dict of kwargs passed to reset(); ranges are (min, max) tuples.
+_DIFFICULTY_PRESETS: Dict[str, Dict] = {
+    "easy": {
+        "n_sources_range": (1, 1),
+        "p_spread_range": (0.10, 0.20),
+        "humidity_range": (0.30, 0.50),
+        "wind_choices": ["CALM"],
+        "max_steps_override": 200,
+    },
+    "medium": {
+        "n_sources_range": (2, 4),
+        "p_spread_range": (0.15, 0.40),
+        "humidity_range": (0.10, 0.45),
+        "wind_choices": list(WIND_DIRS.keys()),
+        "max_steps_override": None,  # use env default
+    },
+    "hard": {
+        "n_sources_range": (3, 5),
+        "p_spread_range": (0.30, 0.55),
+        "humidity_range": (0.05, 0.20),
+        "wind_choices": [d for d in WIND_DIRS.keys() if d != "CALM"],
+        "max_steps_override": 100,
+    },
+}
 
 
 def _idx(x: int, y: int, w: int) -> int:
@@ -101,17 +134,31 @@ class PyreEnvironment(Environment):
     # OpenEnv API
     # ------------------------------------------------------------------
 
-    def reset(self, seed: Optional[int] = None, **kwargs) -> PyreObservation:
-        """Start a new episode with fresh randomized fire parameters."""
+    def reset(self, seed: Optional[int] = None, difficulty: str = "medium", **kwargs) -> PyreObservation:
+        """Start a new episode with fresh randomized fire parameters.
+
+        Args:
+            seed:       Optional integer seed for full reproducibility.
+            difficulty: "easy" | "medium" | "hard" — scales fire behaviour and episode length.
+                        Pass via POST /reset body: {"difficulty": "easy"}
+        """
         fire_seed = seed if seed is not None else (self.base_seed + self._episode_counter * 37)
         self._episode_counter += 1
         self._rng = random.Random(fire_seed)
 
+        # --- Resolve difficulty preset ---
+        preset = _DIFFICULTY_PRESETS.get(difficulty.lower(), _DIFFICULTY_PRESETS["medium"])
+        n_min, n_max = preset["n_sources_range"]
+        sp_min, sp_max = preset["p_spread_range"]
+        hm_min, hm_max = preset["humidity_range"]
+        wind_pool = preset["wind_choices"]
+        effective_max_steps = preset["max_steps_override"] or self.max_steps
+
         # --- Randomize fire behaviour for this episode ---
-        n_sources = self._rng.randint(2, 4)
-        p_spread = round(self._rng.uniform(0.15, 0.40), 3)
-        humidity = round(self._rng.uniform(0.10, 0.45), 3)
-        wind_dir = self._rng.choice(list(WIND_DIRS.keys()))
+        n_sources = self._rng.randint(n_min, n_max)
+        p_spread = round(self._rng.uniform(sp_min, sp_max), 3)
+        humidity = round(self._rng.uniform(hm_min, hm_max), 3)
+        wind_dir = self._rng.choice(wind_pool)
 
         # --- Floor plan ---
         templates = template_names()
@@ -151,7 +198,9 @@ class PyreEnvironment(Environment):
         self._rng.shuffle(fire_candidates)
         fire_sources = fire_candidates[:n_sources]
         for fx, fy in fire_sources:
-            fire_grid[_idx(fx, fy, w)] = 0.5
+            # Start smoldering (0.1) so the agent has a few steps to observe
+            # before fire reaches spreading intensity (>= 0.3).
+            fire_grid[_idx(fx, fy, w)] = 0.1
 
         # --- Door registry ---
         door_registry: Dict[str, List[int]] = {}
@@ -159,6 +208,7 @@ class PyreEnvironment(Environment):
             door_registry[f"door_{j + 1}"] = [dx, dy]
 
         self._last_feedback = "Episode started. Assess your surroundings."
+        self._difficulty = difficulty.lower()
 
         self._state = PyreState.model_construct(
             episode_id=str(uuid.uuid4()),
@@ -178,7 +228,7 @@ class PyreEnvironment(Environment):
             agent_alive=True,
             agent_evacuated=False,
             agent_health=100.0,
-            max_steps=self.max_steps,
+            max_steps=effective_max_steps,
             fire_seed=fire_seed,
             fire_sources_count=n_sources,
             fire_spread_rate=p_spread,
@@ -191,6 +241,8 @@ class PyreEnvironment(Environment):
             p_spread=p_spread,
             wind_dir=wind_dir,
             humidity=humidity,
+            fuel_map=floor_plan.fuel_map,
+            ventilation_map=floor_plan.ventilation_map,
         )
 
         obs_data = build_narrative_observation(
@@ -310,6 +362,7 @@ class PyreEnvironment(Environment):
             "fire_spread_rate": st.fire_spread_rate,
             "fire_sources": st.fire_sources_count,
             "humidity": st.humidity,
+            "difficulty": getattr(self, "_difficulty", "medium"),
         }
         obs_data["map_state"] = self._build_map_state(st)
         return PyreObservation(**obs_data)
@@ -331,6 +384,8 @@ class PyreEnvironment(Environment):
             return self._action_move(action, st)
         elif act == "door":
             return self._action_door(action, st)
+        elif act == "look":
+            return self._action_look(action, st)
         elif act == "wait":
             return "You wait and listen to the building."
         else:
@@ -364,6 +419,23 @@ class PyreEnvironment(Environment):
         if fire > 0.1:
             suffix += " You feel intense heat."
         return f"You move {direction}.{suffix}"
+
+    def _action_look(self, action: PyreAction, st: PyreState) -> str:
+        direction = (action.direction or "").strip().lower()
+        if not direction:
+            return "look requires a direction: north, south, east, or west."
+        return build_look_result(
+            direction=direction,
+            agent_x=st.agent_x,
+            agent_y=st.agent_y,
+            cell_grid=st.cell_grid,
+            fire_grid=st.fire_grid,
+            smoke_grid=st.smoke_grid,
+            zone_map=st.zone_map,
+            door_registry=st.door_registry,
+            w=st.grid_w,
+            h=st.grid_h,
+        )
 
     def _action_door(self, action: PyreAction, st: PyreState) -> str:
         target_id = action.target_id

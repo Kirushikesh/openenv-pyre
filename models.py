@@ -88,10 +88,14 @@ class PyreMapState(BaseModel):
 class PyreAction(Action):
     """Agent action for the Pyre environment.
 
-    action:     "move" | "door" | "wait"
-    direction:  "north"|"south"|"east"|"west"  — used by move
+    action:     "move" | "door" | "wait" | "look"
+    direction:  "north"|"south"|"east"|"west"  — used by move and look
     target_id:  door ID ("door_3")             — used by door
     door_state: "open" | "close"               — used by door
+
+    look: scan up to 5 cells in one direction; returns per-cell descriptions
+          of smoke, fire, doors, exits, and zone labels. Does not move the
+          agent but time still advances (fire spreads this step).
     """
 
     action: str = Field(..., description="Action type")

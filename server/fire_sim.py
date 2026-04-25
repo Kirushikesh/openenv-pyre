@@ -10,13 +10,15 @@ Cellular automaton model with per-episode variability:
   - Walls are completely impassable to fire
   - Smoke propagates faster than fire, weakly through doors
   - Burning cells accumulate a timer; after BURNOUT_TICKS they become obstacles
+  - Per-cell fuel_map scales ignition probability and intensity gain (office rooms burn faster)
+  - Per-cell ventilation_map replaces the global SMOKE_DECAY constant (open areas clear faster)
 
 Wind directions (borrowed from wildfire reference):
   N, NE, E, SE, S, SW, W, NW, CALM
 """
 
 import random
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 # Cell type constants (mirrors models.py)
 FLOOR = 0
@@ -115,6 +117,8 @@ class FireSim:
         wind_dir: str = "CALM",
         humidity: float = 0.25,
         burnout_ticks: int = BURNOUT_TICKS,
+        fuel_map: Optional[List[float]] = None,
+        ventilation_map: Optional[List[float]] = None,
     ):
         self.w = w
         self.h = h
@@ -123,6 +127,9 @@ class FireSim:
         self.wind_dir = wind_dir
         self.humidity = humidity
         self.burnout_ticks = burnout_ticks
+        # None → uniform fuel and ventilation (backward-compatible)
+        self._fuel_map = fuel_map
+        self._ventilation_map = ventilation_map
 
         wind_vec = WIND_DIRS.get(wind_dir, (0, 0))
         self._wind_x = wind_vec[0]
@@ -182,6 +189,11 @@ class FireSim:
 
                     # Wind multiplier
                     p *= _wind_multiplier(dx, dy, self._wind_x, self._wind_y)
+
+                    # Fuel in the target cell scales ignition probability
+                    if self._fuel_map is not None:
+                        p *= self._fuel_map[ni]
+
                     p = min(1.0, p)
 
                     if self.rng.random() < p:
@@ -200,7 +212,10 @@ class FireSim:
                     continue
 
                 if fire_grid[i] > 0:
-                    new_fire[i] = min(1.0, fire_grid[i] + FIRE_INTENSITY_GAIN)
+                    intensity_gain = FIRE_INTENSITY_GAIN
+                    if self._fuel_map is not None:
+                        intensity_gain *= self._fuel_map[i]
+                    new_fire[i] = min(1.0, fire_grid[i] + intensity_gain)
                     if fire_grid[i] >= FIRE_BURNING:
                         new_burn_timers[i] = burn_timers[i] + 1
                     if new_burn_timers[i] >= self.burnout_ticks and new_fire[i] >= 1.0:
@@ -262,6 +277,11 @@ class FireSim:
                         transfer = min(diff * rate, diff * 0.5)
                         new_smoke[ni] = min(1.0, new_smoke[ni] + transfer)
 
-                new_smoke[i] = max(0.0, new_smoke[i] - SMOKE_DECAY)
+                decay = (
+                    self._ventilation_map[i]
+                    if self._ventilation_map is not None
+                    else SMOKE_DECAY
+                )
+                new_smoke[i] = max(0.0, new_smoke[i] - decay)
 
         smoke_grid[:] = new_smoke
