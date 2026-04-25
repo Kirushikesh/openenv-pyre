@@ -1,13 +1,13 @@
 """
 train_grpo_openenv.py — GRPO + LoRA training for Pyre
-                        (PyreEnv WebSocket client, OpenEnv notebook-style pipeline)
+                        (PyreEnvironment in-process, OpenEnv notebook-style pipeline)
 
 Mirrors train_grpo_openenv.py from the reference as closely as possible.
 Differences vs. the reference are intentional and limited to:
 
-  1. Environment is the Pyre fire-evacuation server (WebSocket via PyreEnv.sync()).
-     The reference calls WorldState in-process; Pyre has no in-process equivalent,
-     so a running `uv run server` is required before launching training.
+  1. Environment is PyreEnvironment, called in-process (no server needed).
+     The reference calls WorldState in-process; Pyre uses the same approach —
+     PyreEnvironment is instantiated directly, so no `uv run server` is required.
 
   2. Pyre is a single-environment, difficulty-parametrised task.  For this initial
      training run we fix difficulty to "easy" only (1 fire source, slow spread,
@@ -31,10 +31,6 @@ Differences vs. the reference are intentional and limited to:
 
 Usage
 ─────
-  # 1. Start the Pyre server (from pyre_env/):
-  #      uv run server
-  #
-  # 2. Run training (from pyre_env/):
   python train_grpo_openenv.py
   python train_grpo_openenv.py --model-id Qwen/Qwen3-1.7B --dataset-size 1000
 
@@ -77,7 +73,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from pyre_env import PyreEnv, PyreAction  # noqa: E402
+from pyre_env import PyreAction  # noqa: E402
+from pyre_env.server.pyre_env_environment import PyreEnvironment  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,9 +82,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("grpo_openenv")
-
-# Server URL — set PYRE_SERVER_URL in pyre_env/.env to override
-ENV_URL = os.getenv("PYRE_SERVER_URL", "http://localhost:8000")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,81 +316,79 @@ def rollout_once(
     steps_taken:     int        = 0
     think_steps:     int        = 0
 
-    MAX_TOK_ACCUM = 4096
+    MAX_TOK_ACCUM = 8192
 
     try:
-        with PyreEnv(base_url=ENV_URL).sync() as env:
-            result = env.reset(difficulty=difficulty, seed=seed)
-            obs    = result.observation
-            done   = result.done
+        env  = PyreEnvironment()
+        obs  = env.reset(difficulty=difficulty, seed=seed)
+        done = obs.done
 
-            for _turn in range(max_turns):
-                if done or len(completion_ids) >= MAX_TOK_ACCUM:
-                    break
+        for _turn in range(max_turns):
+            if done or len(completion_ids) >= MAX_TOK_ACCUM:
+                break
 
-                obs_dict = obs.model_dump()
-                user_prompt = make_user_prompt(obs_dict, history)
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_prompt},
-                ]
+            obs_dict = obs.model_dump()
+            user_prompt = make_user_prompt(obs_dict, history)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ]
 
-                try:
-                    prompt_text = tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        tokenize=False,
-                        enable_thinking=True,
-                    )
-                except TypeError:
-                    prompt_text = tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-
-                log.debug(
-                    "\n[difficulty=%s seed=%d step=%d] ── PROMPT ──────────────────────────\n%s\n────────────────────────────────────",
-                    difficulty, seed, _turn + 1, prompt_text,
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=True,
+                )
+            except TypeError:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
                 )
 
-                rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
-                prompt_ids.extend(rollout_outputs["prompt_ids"])
-                completion_ids.extend(rollout_outputs["completion_ids"])
-                logprobs.extend(rollout_outputs.get("logprobs") or [])
-                completion_text = rollout_outputs.get("text") or tokenizer.decode(
-                    rollout_outputs["completion_ids"], skip_special_tokens=False
-                )
+            log.debug(
+                "\n[difficulty=%s seed=%d step=%d] ── PROMPT ──────────────────────────\n%s\n────────────────────────────────────",
+                difficulty, seed, _turn + 1, prompt_text,
+            )
 
-                log.debug(
-                    "\n[difficulty=%s seed=%d step=%d] ── COMPLETION ──────────────────────\n%s\n────────────────────────────────────",
-                    difficulty, seed, _turn + 1, completion_text,
-                )
+            rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
+            prompt_ids.extend(rollout_outputs["prompt_ids"])
+            completion_ids.extend(rollout_outputs["completion_ids"])
+            logprobs.extend(rollout_outputs.get("logprobs") or [])
+            completion_text = rollout_outputs.get("text") or tokenizer.decode(
+                rollout_outputs["completion_ids"], skip_special_tokens=False
+            )
 
-                if "<think>" in completion_text and "</think>" in completion_text:
-                    think_steps += 1
-                steps_taken += 1
+            log.debug(
+                "\n[difficulty=%s seed=%d step=%d] ── COMPLETION ──────────────────────\n%s\n────────────────────────────────────",
+                difficulty, seed, _turn + 1, completion_text,
+            )
 
-                action_dict, fmt_score = parse_action(completion_text)
-                fmt_penalty = (1.0 - fmt_score) * -0.10
+            if "<think>" in completion_text and "</think>" in completion_text:
+                think_steps += 1
+            steps_taken += 1
 
-                result  = env.step(PyreAction(**action_dict))
-                obs     = result.observation
-                step_reward = float(result.reward or 0.0)
-                done    = result.done
+            action_dict, fmt_score = parse_action(completion_text)
+            fmt_penalty = (1.0 - fmt_score) * -0.10
 
-                step_rewards.append(step_reward + fmt_penalty)
+            obs         = env.step(PyreAction(**action_dict))
+            step_reward = float(obs.reward or 0.0)
+            done        = obs.done
 
-                feedback = obs.last_action_feedback or ""
-                # Reward is intentionally excluded from the history entry.
-                history.append(
-                    f"Step {_turn + 1}: {json.dumps(action_dict)}"
-                    + (f"\n  → {feedback}" if feedback else "")
-                    + f"\n  health: {obs.agent_health:.1f}"
-                )
+            step_rewards.append(step_reward + fmt_penalty)
 
-            agent_evacuated = obs.agent_evacuated
-            final_health    = float(obs.agent_health)
+            feedback = obs.last_action_feedback or ""
+            # Reward is intentionally excluded from the history entry.
+            history.append(
+                f"Step {_turn + 1}: {json.dumps(action_dict)}"
+                + (f"\n  → {feedback}" if feedback else "")
+                + f"\n  health: {obs.agent_health:.1f}"
+            )
+
+        agent_evacuated = obs.agent_evacuated
+        final_health    = float(obs.agent_health)
 
     except Exception as exc:
         log.error("Episode failed (difficulty=%s seed=%d): %s", difficulty, seed, exc)
@@ -568,17 +560,6 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
         log.debug("Debug logging enabled — full prompt/completion will be printed each step.")
 
-    # ── Server health check ─────────────────────────────────────────────────
-    import requests as _requests
-    try:
-        _requests.get(f"{ENV_URL}/health", timeout=5).raise_for_status()
-        log.info("Pyre server: healthy ✓  (%s)", ENV_URL)
-    except Exception as exc:
-        raise SystemExit(
-            f"Pyre server not reachable at {ENV_URL}: {exc}\n"
-            "Start it with:  uv run server"
-        )
-
     # ── Init tokenizer ──────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -595,22 +576,26 @@ if __name__ == "__main__":
     #
     # Matching the reference notebook, with one Pyre-specific override:
     #
-    #   max_completion_length  1024 → 512   (<think> + small JSON action)
+    #   max_completion_length  512 → 1024   (safe margin for Qwen3 think + JSON action)
     #
     # Everything else — lr, grad_accum, num_generations, vLLM colocate,
     # gradient checkpointing, push_to_hub — is identical to the reference.
     grpo_config = GRPOConfig(
+        model_init_kwargs={
+            "torch_dtype": "bfloat16",
+            "attn_implementation": "eager",
+        },
         num_train_epochs=1,
         learning_rate=5e-6,
         gradient_accumulation_steps=64,
         per_device_train_batch_size=1,
         warmup_steps=20,
         num_generations=2,
-        max_completion_length=512,
+        max_completion_length=1024,
         use_vllm=True,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.3,
-        vllm_max_model_len=8192,
+        vllm_max_model_length=8192,
         output_dir=args.output_dir,
         report_to=args.report_to,
         trackio_space_id=args.output_dir if args.report_to == "trackio" else None,
@@ -625,10 +610,6 @@ if __name__ == "__main__":
     # ── Create trainer ──────────────────────────────────────────────────────
     trainer = GRPOTrainer(
         model=args.model_id,
-        model_init_kwargs={
-            "torch_dtype": torch.bfloat16,
-            "attn_implementation": "eager",
-        },
         processing_class=tokenizer,
         reward_funcs=[
             reward_evacuated,
