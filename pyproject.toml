@@ -40,6 +40,7 @@ train = [
     "flashinfer-python==0.6.3",
     "flashinfer-cubin==0.6.3",
     "jupyter>=1.1.1",
+    "flash-attn>=2.7.0",
 ]
 
 [project.scripts]
@@ -51,3 +52,6 @@ server = "pyre_env.server.app:main"
 include-package-data = true
 packages = ["pyre_env", "pyre_env.server"]
 package-dir = { "pyre_env" = ".", "pyre_env.server" = "server" }
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]

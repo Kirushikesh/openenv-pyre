@@ -583,14 +583,14 @@ if __name__ == "__main__":
     grpo_config = GRPOConfig(
         model_init_kwargs={
             "torch_dtype": "bfloat16",
-            "attn_implementation": "eager",
+            "attn_implementation": "flash_attention_2",
         },
         num_train_epochs=1,
         learning_rate=5e-6,
-        gradient_accumulation_steps=64,
+        gradient_accumulation_steps=8,
         per_device_train_batch_size=1,
         warmup_steps=20,
-        num_generations=2,
+        num_generations=4,
         max_completion_length=1024,
         use_vllm=True,
         vllm_mode="colocate",
