@@ -11,15 +11,18 @@ from .models import PyreAction, PyreObservation, PyreState
 class PyreEnv(EnvClient[PyreAction, PyreObservation, PyreState]):
     """Client for the Pyre Environment.
 
-    Maintains a persistent WebSocket connection to the environment server.
-    Each instance has its own isolated episode.
+    The environment is async by default; use .sync() for synchronous access:
 
-    Example:
-        >>> with PyreEnv(base_url="http://localhost:8000") as env:
-        ...     result = env.reset()
-        ...     print(result.observation.narrative)
-        ...     result = env.step(PyreAction(action="move", direction="north"))
-        ...     print(result.observation.narrative)
+        with PyreEnv(base_url="http://localhost:8000").sync() as env:
+            result = env.reset()
+            print(result.observation.narrative)
+            result = env.step(PyreAction(action="move", direction="north"))
+            print(f"Health: {result.observation.agent_health}")
+
+    Or use async:
+
+        async with PyreEnv(base_url="http://localhost:8000") as env:
+            result = await env.reset()
     """
 
     def _step_payload(self, action: PyreAction) -> Dict:
@@ -29,12 +32,16 @@ class PyreEnv(EnvClient[PyreAction, PyreObservation, PyreState]):
         obs_data = payload.get("observation", payload)
         obs = PyreObservation(
             narrative=obs_data.get("narrative", ""),
+            agent_evacuated=obs_data.get("agent_evacuated", False),
             location_label=obs_data.get("location_label", ""),
             smoke_level=obs_data.get("smoke_level", "none"),
             fire_visible=obs_data.get("fire_visible", False),
             fire_direction=obs_data.get("fire_direction"),
-            visible_people=obs_data.get("visible_people", []),
+            agent_health=obs_data.get("agent_health", 100.0),
+            health_status=obs_data.get("health_status", "Good"),
+            wind_dir=obs_data.get("wind_dir", "CALM"),
             visible_objects=obs_data.get("visible_objects", []),
+            blocked_exit_ids=obs_data.get("blocked_exit_ids", []),
             audible_signals=obs_data.get("audible_signals", []),
             elapsed_steps=obs_data.get("elapsed_steps", 0),
             last_action_feedback=obs_data.get("last_action_feedback", ""),

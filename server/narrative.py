@@ -1,5 +1,5 @@
 """
-Observation rendering for Pyre.
+Observation rendering for Pyre (single-agent).
 
 Converts raw server state into:
   - A first-person narrative string (the LLM's primary input)
@@ -10,13 +10,18 @@ Visibility rules:
   - Moderate smoke in agent's cell: radius 3
   - Heavy smoke in agent's cell: radius 2
   - Walls block flood-fill propagation
+
+Health status labels:
+  80–100 : Good
+  50–79  : Moderate
+  25–49  : Low
+  0–24   : Critical
 """
 
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from .fire_sim import smoke_level_label, FIRE_BURNING
+from .fire_sim import smoke_level_label, FIRE_BURNING, EXIT_BLOCKED_FIRE_THRESHOLD
 
-# Cell type constants
 FLOOR = 0
 WALL = 1
 DOOR_OPEN = 2
@@ -40,34 +45,39 @@ def _manhattan(x1: int, y1: int, x2: int, y2: int) -> int:
     return abs(x1 - x2) + abs(y1 - y2)
 
 
+def _health_label(health: float) -> str:
+    if health >= 80:
+        return "Good"
+    if health >= 50:
+        return "Moderate"
+    if health >= 25:
+        return "Low"
+    return "Critical"
+
+
 # ---------------------------------------------------------------------------
 # Visibility computation
 # ---------------------------------------------------------------------------
 
 def compute_visible_cells(
-    ax: int,
-    ay: int,
+    ax: int, ay: int,
     cell_grid: List[int],
     smoke_grid: List[float],
-    w: int,
-    h: int,
+    w: int, h: int,
 ) -> Set[Tuple[int, int]]:
-    """BFS flood-fill from agent position; walls block propagation.
-
-    Returns set of (x, y) the agent can currently perceive.
-    """
+    """BFS flood-fill from agent; walls block propagation."""
     agent_smoke = smoke_grid[_idx(ax, ay, w)]
-    smoke_label = smoke_level_label(agent_smoke)
+    label = smoke_level_label(agent_smoke)
 
-    if smoke_label == "heavy":
+    if label == "heavy":
         radius = 2
-    elif smoke_label == "moderate":
+    elif label == "moderate":
         radius = 3
     else:
         radius = 5
 
     visible: Set[Tuple[int, int]] = {(ax, ay)}
-    queue = [(ax, ay, 0)]  # (x, y, dist)
+    queue = [(ax, ay, 0)]
 
     while queue:
         x, y, dist = queue.pop(0)
@@ -81,7 +91,7 @@ def compute_visible_cells(
                 continue
             ct = cell_grid[_idx(nx, ny, w)]
             if ct == WALL:
-                continue  # walls block LOS and are themselves not visible
+                continue
             visible.add((nx, ny))
             queue.append((nx, ny, dist + 1))
 
@@ -89,7 +99,7 @@ def compute_visible_cells(
 
 
 # ---------------------------------------------------------------------------
-# Narrative builder
+# Main builder
 # ---------------------------------------------------------------------------
 
 def build_narrative_observation(
@@ -98,34 +108,35 @@ def build_narrative_observation(
     agent_y: int,
     agent_alive: bool,
     agent_evacuated: bool,
+    agent_health: float,
     cell_grid: List[int],
     fire_grid: List[float],
     smoke_grid: List[float],
-    npcs: List[Dict[str, Any]],
     exit_positions: List[List[int]],
     door_registry: Dict[str, List[int]],
     zone_map: Dict[str, str],
     last_action_feedback: str,
+    wind_dir: str,
     w: int,
     h: int,
 ) -> Dict[str, Any]:
-    """Build the full observation dict (matches PyreObservation fields).
-
-    Returns a dict suitable for PyreObservation(**result).
-    """
+    """Build the full observation dict (matches PyreObservation fields)."""
     if agent_evacuated:
-        return _terminal_obs(step_count, last_action_feedback, done=True, reward=0.0,
-                             narrative="You have safely evacuated the building.")
+        return _terminal_obs(step_count, last_action_feedback,
+                             narrative="You have safely evacuated the building.",
+                             agent_evacuated=True)
 
     if not agent_alive:
-        return _terminal_obs(step_count, last_action_feedback, done=True, reward=0.0,
-                             narrative="You have been overcome by fire and smoke.")
+        return _terminal_obs(step_count, last_action_feedback,
+                             narrative="You have been overcome by fire and smoke.",
+                             agent_evacuated=False)
 
     visible = compute_visible_cells(agent_x, agent_y, cell_grid, smoke_grid, w, h)
 
-    # --- Smoke level at agent cell ---
+    # --- Agent cell conditions ---
     agent_smoke = smoke_grid[_idx(agent_x, agent_y, w)]
     smoke_label = smoke_level_label(agent_smoke)
+    health_label = _health_label(agent_health)
 
     # --- Fire visibility ---
     fire_visible = False
@@ -139,7 +150,6 @@ def build_narrative_observation(
             d = _manhattan(agent_x, agent_y, vx, vy)
             if d < nearest_fire_dist:
                 nearest_fire_dist = d
-                # Determine cardinal direction of nearest fire
                 dx = vx - agent_x
                 dy = vy - agent_y
                 if abs(dx) >= abs(dy):
@@ -147,62 +157,56 @@ def build_narrative_observation(
                 else:
                     fire_dir = "south" if dy > 0 else "north"
 
-    # --- Visible NPCs ---
-    npc_set = {(int(n["x"]), int(n["y"])): n for n in npcs}
-    visible_people: List[Dict[str, Any]] = []
-    for vx, vy in visible:
-        if (vx, vy) == (agent_x, agent_y):
-            continue
-        npc = npc_set.get((vx, vy))
-        if npc:
-            rel = _relative_pos_str(agent_x, agent_y, vx, vy)
-            visible_people.append({
-                "id": npc["id"],
-                "relative_pos": rel,
-                "state": npc["state"],
-                "last_seen_step": step_count,
-            })
-
     # --- Visible objects (doors and exits) ---
     visible_objects: List[Dict[str, Any]] = []
     door_pos_to_id = {(v[0], v[1]): k for k, v in door_registry.items()}
+    blocked_exit_ids: List[str] = []
+
     for vx, vy in visible:
         ct = cell_grid[_idx(vx, vy, w)]
         rel = _relative_pos_str(agent_x, agent_y, vx, vy)
+
         if ct in (DOOR_OPEN, DOOR_CLOSED):
             door_id = door_pos_to_id.get((vx, vy), f"door_{vx}_{vy}")
             door_state = "open" if ct == DOOR_OPEN else "closed"
-            # Annotate hot doors
             if fire_grid[_idx(vx, vy, w)] > 0.1:
                 door_state += " (hot)"
             visible_objects.append({
-                "id": door_id,
-                "type": "door",
-                "relative_pos": rel,
-                "state": door_state,
+                "id": door_id, "type": "door",
+                "relative_pos": rel, "state": door_state,
             })
+
         elif ct == EXIT:
+            fire_at_exit = fire_grid[_idx(vx, vy, w)]
+            exit_id = f"exit_{vx}_{vy}"
+            if fire_at_exit >= EXIT_BLOCKED_FIRE_THRESHOLD:
+                exit_state = "BLOCKED by fire"
+                blocked_exit_ids.append(exit_id)
+            else:
+                exit_state = "open"
             visible_objects.append({
-                "id": f"exit_{vx}_{vy}",
-                "type": "exit",
-                "relative_pos": rel,
-                "state": "open",
+                "id": exit_id, "type": "exit",
+                "relative_pos": rel, "state": exit_state,
             })
+
+    # Exits not visible — still flag blocked ones from known positions
+    visible_coords = {(vx, vy) for vx, vy in visible}
+    for ex in exit_positions:
+        ex_id = f"exit_{ex[0]}_{ex[1]}"
+        if (ex[0], ex[1]) not in visible_coords:
+            if fire_grid[_idx(ex[0], ex[1], w)] >= EXIT_BLOCKED_FIRE_THRESHOLD:
+                if ex_id not in blocked_exit_ids:
+                    blocked_exit_ids.append(ex_id)
 
     # --- Audible signals ---
     audible: List[str] = []
-    # Alarm if any fire is burning in the map
     any_fire = any(fire_grid[i] >= FIRE_BURNING for i in range(w * h))
     if any_fire:
         audible.append("Fire alarm sounding")
-    # Screams from panicked NPCs within extended radius (7)
-    panicked_nearby = [
-        n for n in npcs
-        if n["state"] in ("panicked", "injured")
-        and _manhattan(agent_x, agent_y, int(n["x"]), int(n["y"])) <= 7
-    ]
-    if panicked_nearby:
-        audible.append(f"Screaming from nearby")
+    if smoke_label in ("moderate", "heavy"):
+        audible.append("Smoke detector beeping")
+    if agent_health < 50:
+        audible.append("Your own laboured breathing")
 
     # --- Zone label ---
     location_label = zone_map.get(f"{agent_x},{agent_y}", "unknown area")
@@ -210,17 +214,20 @@ def build_narrative_observation(
     # --- Action hints ---
     action_hints = _build_action_hints(
         agent_x, agent_y, cell_grid, visible,
-        visible_people, visible_objects, door_registry, exit_positions, w, h
+        visible_objects, door_registry, w, h
     )
 
-    # --- Narrative string ---
+    # --- Narrative ---
     narrative = _compose_narrative(
         location_label=location_label,
         smoke_label=smoke_label,
         fire_visible=fire_visible,
         fire_dir=fire_dir,
-        visible_people=visible_people,
+        agent_health=agent_health,
+        health_label=health_label,
+        wind_dir=wind_dir,
         visible_objects=visible_objects,
+        blocked_exit_ids=blocked_exit_ids,
         audible=audible,
         last_action_feedback=last_action_feedback,
         action_hints=action_hints,
@@ -228,18 +235,22 @@ def build_narrative_observation(
 
     return {
         "narrative": narrative,
+        "agent_evacuated": agent_evacuated,
         "location_label": location_label,
         "smoke_level": smoke_label,
         "fire_visible": fire_visible,
         "fire_direction": fire_dir,
-        "visible_people": visible_people,
+        "agent_health": agent_health,
+        "health_status": health_label,
+        "wind_dir": wind_dir,
         "visible_objects": visible_objects,
+        "blocked_exit_ids": blocked_exit_ids,
         "audible_signals": audible,
         "elapsed_steps": step_count,
         "last_action_feedback": last_action_feedback,
         "available_actions_hint": action_hints,
         "done": False,
-        "reward": 0.0,  # filled by environment
+        "reward": 0.0,
     }
 
 
@@ -250,25 +261,21 @@ def build_narrative_observation(
 def _relative_pos_str(ax: int, ay: int, tx: int, ty: int) -> str:
     dx, dy = tx - ax, ty - ay
     dist = abs(dx) + abs(dy)
+    if dist == 0:
+        return "here"
     if abs(dx) >= abs(dy):
-        horiz = f"{abs(dx)}m {'east' if dx > 0 else 'west'}"
-        return f"{horiz}" if dist <= 3 else f"{dist}m {'east' if dx > 0 else 'west'}"
+        return f"{dist}m {'east' if dx > 0 else 'west'}"
     else:
-        vert = f"{abs(dy)}m {'south' if dy > 0 else 'north'}"
-        return f"{vert}" if dist <= 3 else f"{dist}m {'south' if dy > 0 else 'north'}"
+        return f"{dist}m {'south' if dy > 0 else 'north'}"
 
 
 def _build_action_hints(
-    ax: int,
-    ay: int,
+    ax: int, ay: int,
     cell_grid: List[int],
     visible: Set[Tuple[int, int]],
-    visible_people: List[Dict],
     visible_objects: List[Dict],
     door_registry: Dict[str, List[int]],
-    exit_positions: List[List[int]],
-    w: int,
-    h: int,
+    w: int, h: int,
 ) -> List[str]:
     hints: List[str] = []
 
@@ -285,18 +292,9 @@ def _build_action_hints(
         if obj["type"] == "door":
             did = obj["id"]
             if "closed" in obj["state"]:
-                hints.append(f"open_door(target_id='{did}')")
+                hints.append(f"door(target_id='{did}', door_state='open')")
             else:
-                hints.append(f"close_door(target_id='{did}')")
-
-    # Instruct NPCs
-    for person in visible_people[:3]:  # cap hints
-        pid = person["id"]
-        hints.append(f"instruct(target_id='{pid}', direction='south')")
-
-    # Broadcast (always available if there are active NPCs nearby)
-    if visible_people:
-        hints.append("broadcast(zone='main_corridor', category='evacuate_south')")
+                hints.append(f"door(target_id='{did}', door_state='close')")
 
     hints.append("wait()")
     return hints
@@ -307,8 +305,11 @@ def _compose_narrative(
     smoke_label: str,
     fire_visible: bool,
     fire_dir: Optional[str],
-    visible_people: List[Dict],
+    agent_health: float,
+    health_label: str,
+    wind_dir: str,
     visible_objects: List[Dict],
+    blocked_exit_ids: List[str],
     audible: List[str],
     last_action_feedback: str,
     action_hints: List[str],
@@ -318,30 +319,34 @@ def _compose_narrative(
     # Location + atmosphere
     lines.append(f"You are in the **{location_label}**. The air is **{smoke_label}**.")
 
+    # Health + wind
+    health_bar = _health_bar(agent_health)
+    wind_str = f"Wind: **{wind_dir}**" if wind_dir != "CALM" else "Wind: calm"
+    lines.append(f"Health: {health_bar} ({health_label})  |  {wind_str}")
+
     # Fire
     if fire_visible and fire_dir:
         lines.append(f"Flames are visible to the **{fire_dir}**.")
     else:
         lines.append("No fire directly visible.")
 
-    # People
-    if visible_people:
-        descs = []
-        for p in visible_people:
-            descs.append(f"{p['id']} ({p['state']}) is {p['relative_pos']}")
-        lines.append(f"{len(visible_people)} {'person' if len(visible_people) == 1 else 'people'} nearby: {', '.join(descs)}.")
-    else:
-        lines.append("No one visible nearby.")
+    # Objects (exits and doors)
+    exits_vis = [o for o in visible_objects if o["type"] == "exit"]
+    doors_vis = [o for o in visible_objects if o["type"] == "door"]
 
-    # Objects
-    exits = [o for o in visible_objects if o["type"] == "exit"]
-    doors = [o for o in visible_objects if o["type"] == "door"]
-    if exits:
-        exit_descs = [f"exit at {o['relative_pos']}" for o in exits]
-        lines.append(f"Exit{'s' if len(exits) > 1 else ''} visible: {', '.join(exit_descs)}.")
-    if doors:
-        door_descs = [f"{o['id']} ({o['state']}) at {o['relative_pos']}" for o in doors]
-        lines.append(f"Door{'s' if len(doors) > 1 else ''}: {', '.join(door_descs)}.")
+    if exits_vis:
+        exit_descs = []
+        for o in exits_vis:
+            status = " **[BLOCKED]**" if o["state"].startswith("BLOCKED") else ""
+            exit_descs.append(f"{o['id']}{status} at {o['relative_pos']}")
+        lines.append(f"Exit{'s' if len(exits_vis) > 1 else ''} visible: {', '.join(exit_descs)}.")
+
+    if doors_vis:
+        door_descs = [f"{o['id']} ({o['state']}) at {o['relative_pos']}" for o in doors_vis]
+        lines.append(f"Door{'s' if len(doors_vis) > 1 else ''}: {', '.join(door_descs)}.")
+
+    if blocked_exit_ids:
+        lines.append(f"WARNING: {len(blocked_exit_ids)} exit(s) blocked by fire — find an alternative route.")
 
     # Sound
     if audible:
@@ -359,25 +364,34 @@ def _compose_narrative(
     return "\n".join(lines)
 
 
+def _health_bar(health: float) -> str:
+    filled = int(health / 10)
+    empty = 10 - filled
+    return "█" * filled + "░" * empty + f" {int(health)}/100"
+
+
 def _terminal_obs(
     step_count: int,
     last_action_feedback: str,
-    done: bool,
-    reward: float,
     narrative: str,
+    agent_evacuated: bool = False,
 ) -> Dict[str, Any]:
     return {
         "narrative": narrative,
+        "agent_evacuated": agent_evacuated,
         "location_label": "",
         "smoke_level": "none",
         "fire_visible": False,
         "fire_direction": None,
-        "visible_people": [],
+        "agent_health": 0.0 if not agent_evacuated else 100.0,
+        "health_status": "Critical" if not agent_evacuated else "Good",
+        "wind_dir": "CALM",
         "visible_objects": [],
+        "blocked_exit_ids": [],
         "audible_signals": [],
         "elapsed_steps": step_count,
         "last_action_feedback": last_action_feedback,
         "available_actions_hint": [],
-        "done": done,
-        "reward": reward,
+        "done": True,
+        "reward": 0.0,
     }

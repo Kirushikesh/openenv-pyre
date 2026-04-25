@@ -1,146 +1,112 @@
-"""Random-action baseline agent for Pyre.
+"""Random-action baseline agent for Pyre (single-agent).
 
-Runs N episodes with random actions and prints per-episode stats.
+Runs N episodes using the PyreEnv client and prints per-episode stats.
 Use this to smoke-test the server and verify the reward distribution
 spans a meaningful range.
 
 Usage:
     # Server must be running first:
-    #   uv run server   (from pyre_env/ directory)
+    #   cd pyre_env && uv run server
     #
-    python examples/random_agent.py --episodes 5 --max-steps 50
-    python examples/random_agent.py --url http://localhost:8000
+    python examples/random_agent.py --episodes 5
+    python examples/random_agent.py --episodes 5 --verbose
+    python examples/random_agent.py --url http://localhost:8000 --episodes 10
 """
 
 import argparse
 import random
 import sys
-import time
 from typing import List
 
 import requests
 
+from pyre_env import PyreEnv, PyreAction
+
 
 # ---------------------------------------------------------------------------
-# Action space (must match server-side PyreAction)
+# Action sampling
 # ---------------------------------------------------------------------------
 
-MOVE_DIRS = ["north", "south", "east", "west"]
-BROADCAST_CATEGORIES = [
-    "evacuate_north", "evacuate_south", "evacuate_east", "evacuate_west",
-    "stay_calm", "use_exit_1", "use_exit_2",
-]
-
-
-def random_action(obs: dict, rng: random.Random) -> dict:
-    """Build a random but structurally valid action from the current observation."""
-    action_hints = obs.get("available_actions_hint", [])
-
-    # 60% of the time: follow an available action hint
-    if action_hints and rng.random() < 0.6:
-        hint = rng.choice(action_hints)
-        parsed = _parse_hint(hint)
-        if parsed:
-            return parsed
-
-    # Fallback: random move
-    return {"action": "move", "direction": rng.choice(MOVE_DIRS)}
-
-
-def _parse_hint(hint: str) -> dict:
-    """Parse a hint string like move(direction='north') into an action dict."""
+def _parse_hint(hint: str) -> PyreAction:
+    """Parse a hint string from available_actions_hint into a PyreAction."""
     try:
-        hint = hint.strip()
-        if hint.startswith("move("):
-            # move(direction='north')
-            direction = hint.split("'")[1]
-            return {"action": "move", "direction": direction}
-        elif hint.startswith("close_door("):
-            door_id = hint.split("'")[1]
-            return {"action": "close_door", "target_id": door_id}
-        elif hint.startswith("open_door("):
-            door_id = hint.split("'")[1]
-            return {"action": "open_door", "target_id": door_id}
-        elif hint.startswith("instruct("):
-            # instruct(target_id='p_1', direction='south')
-            parts = hint.split("'")
+        h = hint.strip()
+        if h.startswith("move("):
+            return PyreAction(action="move", direction=h.split("'")[1])
+        elif h.startswith("door("):
+            parts = h.split("'")
+            # parts: ["door(target_id=", did, ", door_state=", state, ")"]
             target_id = parts[1]
-            direction = parts[3]
-            return {"action": "instruct", "target_id": target_id, "direction": direction}
-        elif hint.startswith("broadcast("):
-            parts = hint.split("'")
-            zone = parts[1]
-            category = parts[3]
-            return {"action": "broadcast", "zone": zone, "category": category}
-        elif hint == "wait()":
-            return {"action": "wait"}
+            door_state = parts[3]
+            return PyreAction(action="door", target_id=target_id, door_state=door_state)
+        elif h == "wait()":
+            return PyreAction(action="wait")
     except (IndexError, ValueError):
         pass
-    return {}
+    return PyreAction(action="wait")
+
+
+def random_action(hints: List[str], rng: random.Random) -> PyreAction:
+    """Pick a random action, biasing toward available hints 70% of the time."""
+    if hints and rng.random() < 0.7:
+        return _parse_hint(rng.choice(hints))
+    # Fallback: random move
+    return PyreAction(action="move", direction=rng.choice(["north", "south", "east", "west"]))
 
 
 # ---------------------------------------------------------------------------
-# HTTP helpers (no client library needed)
+# Episode runner
 # ---------------------------------------------------------------------------
 
-def api_reset(base_url: str) -> dict:
-    r = requests.post(f"{base_url}/reset", timeout=10)
-    r.raise_for_status()
-    return r.json()
+def run_episode(env, max_steps: int, rng: random.Random, verbose: bool) -> dict:
+    result = env.reset()
+    obs = result.observation
 
+    episode_reward = 0.0
+    steps = 0
+    done = result.done
 
-def api_step(base_url: str, action: dict) -> dict:
-    r = requests.post(f"{base_url}/step", json=action, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    while not done and steps < max_steps:
+        action = random_action(obs.available_actions_hint, rng)
+        result = env.step(action)
+        obs = result.observation
+        reward = result.reward or 0.0
+        done = result.done
+        episode_reward += reward
+        steps += 1
+
+        if verbose:
+            first_line = obs.narrative.split("\n")[0] if obs.narrative else ""
+            print(
+                f"  step {steps:3d} | hp={obs.agent_health:5.1f}"
+                f" | r={reward:+.3f} | done={done} | {first_line[:70]}"
+            )
+
+    meta = obs.metadata or {}
+    return {
+        "steps": steps,
+        "total_reward": round(episode_reward, 3),
+        "done": done,
+        "evacuated": obs.agent_evacuated,
+        "final_health": obs.agent_health,
+        "wind_dir": obs.wind_dir,
+        "fire_sources": meta.get("fire_sources", "?"),
+        "fire_spread": meta.get("fire_spread_rate", "?"),
+        "last_narrative": obs.narrative[:120] if obs.narrative else "",
+    }
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def run_episode(base_url: str, max_steps: int, rng: random.Random, verbose: bool) -> dict:
-    result = api_reset(base_url)
-    obs = result.get("observation", result)
-
-    episode_reward = 0.0
-    steps = 0
-    done = result.get("done", False)
-
-    while not done and steps < max_steps:
-        action = random_action(obs, rng)
-        result = api_step(base_url, action)
-
-        obs = result.get("observation", result)
-        reward = result.get("reward", 0.0)
-        done = result.get("done", False)
-        episode_reward += reward
-        steps += 1
-
-        if verbose:
-            narrative = obs.get("narrative", "")
-            first_line = narrative.split("\n")[0] if narrative else ""
-            print(f"  step {steps:3d} | r={reward:+.3f} | done={done} | {first_line[:80]}")
-
-    meta = result.get("metadata", {})
-    return {
-        "steps": steps,
-        "total_reward": round(episode_reward, 3),
-        "done": done,
-        "npcs_evacuated": meta.get("npcs_evacuated", "?"),
-        "npcs_casualties": meta.get("npcs_casualties", "?"),
-        "stampede_events": meta.get("stampede_events", "?"),
-        "last_narrative": obs.get("narrative", "")[:120],
-    }
-
-
 def main():
     parser = argparse.ArgumentParser(description="Pyre random-agent baseline")
     parser.add_argument("--url", default="http://localhost:8000", help="Server base URL")
-    parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to run")
-    parser.add_argument("--max-steps", type=int, default=80, help="Max steps per episode")
-    parser.add_argument("--seed", type=int, default=7, help="RNG seed")
-    parser.add_argument("--verbose", action="store_true", help="Print each step")
+    parser.add_argument("--episodes", type=int, default=5)
+    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     # Health check
@@ -155,15 +121,17 @@ def main():
     rng = random.Random(args.seed)
     results: List[dict] = []
 
-    for ep in range(args.episodes):
-        print(f"\n=== Episode {ep + 1}/{args.episodes} ===")
-        stats = run_episode(args.url, args.max_steps, rng, args.verbose)
-        results.append(stats)
-        print(
-            f"  DONE  steps={stats['steps']}  reward={stats['total_reward']:+.3f}"
-            f"  evac={stats['npcs_evacuated']}  casualties={stats['npcs_casualties']}"
-            f"  stampedes={stats['stampede_events']}"
-        )
+    with PyreEnv(base_url=args.url).sync() as env:
+        for ep in range(args.episodes):
+            print(f"\n=== Episode {ep + 1}/{args.episodes} ===")
+            stats = run_episode(env, args.max_steps, rng, args.verbose)
+            results.append(stats)
+            print(
+                f"  DONE  steps={stats['steps']}  reward={stats['total_reward']:+.3f}"
+                f"  health={stats['final_health']:.1f}"
+                f"  wind={stats['wind_dir']}  sources={stats['fire_sources']}"
+                f"  spread={stats['fire_spread']}"
+            )
 
     print("\n=== Summary ===")
     rewards = [r["total_reward"] for r in results]
