@@ -88,6 +88,34 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 # ---------------------------------------------------------------------------
+# TeeLogger — mirrors all stdout output to a log file simultaneously
+# ---------------------------------------------------------------------------
+
+class TeeLogger:
+    """Writes every print() to both the original stdout and a log file."""
+
+    def __init__(self, stream, log_path: Path) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = stream
+        self._file = open(log_path, "w", buffering=1, encoding="utf-8")
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
+
+
+# ---------------------------------------------------------------------------
 # Optional torch import — fail fast with a helpful message
 # ---------------------------------------------------------------------------
 try:
@@ -1333,6 +1361,9 @@ def parse_args() -> argparse.Namespace:
                    help="Save per-episode metrics as CSV alongside the model")
     p.add_argument("--save-graph", action="store_true", default=True,
                    help="Save a PNG training graph alongside the model (requires matplotlib)")
+    p.add_argument("--log-file", type=str, default=None,
+                   help="Path to write a copy of all console output (e.g. artifacts/train.log). "
+                        "Output is written to both the terminal and the file simultaneously.")
 
     # Misc
     p.add_argument("--seed", type=int, default=42)
@@ -1352,7 +1383,20 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    train(args)
+    log_tee = None
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_tee = TeeLogger(sys.stdout, log_path)
+        sys.stdout = log_tee  # type: ignore[assignment]
+        print(f"[log] Writing console output to {log_path}", flush=True)
+
+    try:
+        train(args)
+    finally:
+        if log_tee:
+            sys.stdout = log_tee._stream
+            log_tee.close()
+            print(f"[log] Training log saved -> {args.log_file}")
 
 
 if __name__ == "__main__":

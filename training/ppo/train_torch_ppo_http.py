@@ -41,9 +41,36 @@ import torch
 import torch.optim as optim
 
 # ---------------------------------------------------------------------------
+# TeeLogger — mirrors all stdout output to a log file simultaneously
+# ---------------------------------------------------------------------------
+
+class TeeLogger:
+    """Writes every print() to both the original stdout and a log file."""
+
+    def __init__(self, stream, log_path: Path) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = stream
+        self._file = open(log_path, "w", buffering=1, encoding="utf-8")
+
+    def write(self, data: str) -> int:
+        self._stream.write(data)
+        self._file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
+
+# ---------------------------------------------------------------------------
 # Resolve project root so we can import shared models regardless of CWD
 # ---------------------------------------------------------------------------
-_HERE = Path(__file__).resolve().parent
+_HERE = Path(__file__).resolve().parent.parent
 _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -54,7 +81,7 @@ except ImportError:
     from openenv_pyre.models import PyreAction, PyreMapState, PyreObservation
 
 # Reuse all shared utilities from the direct-import trainer
-from examples.train_torch_ppo import (
+from training.ppo.train_torch_ppo import (
     ACTION_KEYS,
     ACTION_DIM,
     ACTION_TO_INDEX,
@@ -597,6 +624,9 @@ def parse_args() -> argparse.Namespace:
                    help="Path to a checkpoint (.pt) to resume training from")
     p.add_argument("--save-metrics", action="store_true", default=True)
     p.add_argument("--save-graph", action="store_true", default=True)
+    p.add_argument("--log-file", type=str, default=None,
+                   help="Path to write a copy of all console output (e.g. artifacts/train_http.log). "
+                        "Output is written to both the terminal and the file simultaneously.")
     p.add_argument("--seed", type=int, default=42)
 
     return p.parse_args()
@@ -606,7 +636,21 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    train(args)
+
+    log_tee = None
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_tee = TeeLogger(sys.stdout, log_path)
+        sys.stdout = log_tee  # type: ignore[assignment]
+        print(f"[log] Writing console output to {log_path}", flush=True)
+
+    try:
+        train(args)
+    finally:
+        if log_tee:
+            sys.stdout = log_tee._stream
+            log_tee.close()
+            print(f"[log] Training log saved -> {args.log_file}")
 
 
 if __name__ == "__main__":

@@ -36,11 +36,11 @@ train = [
     "transformers>=4.57.6",
     "trl>=1.2.0",
     "tornado>=6.5.5",
-    "vllm>=0.11.0,<=0.18.0",
-    "flashinfer-python==0.6.3",
-    "flashinfer-cubin==0.6.3",
+    "vllm>=0.11.0,<=0.18.0; sys_platform == 'linux'",
+    "flashinfer-python==0.6.3; sys_platform == 'linux'",
+    "flashinfer-cubin==0.6.3; sys_platform == 'linux'",
     "jupyter>=1.1.1",
-    "flash-attn>=2.7.0",
+    "flash-attn>=2.7.0; sys_platform == 'linux'",
 ]
 
 [project.scripts]

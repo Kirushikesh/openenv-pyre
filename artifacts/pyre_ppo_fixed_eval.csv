@@ -1,0 +1,11 @@
+episode,difficulty,reward_mean,success_rate,steps_mean
+20,medium,15.6975,1.0,7.0
+40,medium,15.64,1.0,4.3
+60,medium,16.8867,1.0,9.0
+80,medium,15.1617,1.0,10.3
+100,medium,6.0075,0.667,57.0
+120,medium,6.4008,0.667,32.7
+140,medium,16.2833,1.0,6.3
+160,medium,16.5733,1.0,8.3
+180,medium,16.3967,1.0,8.0
+200,medium,6.8067,0.667,14.7
