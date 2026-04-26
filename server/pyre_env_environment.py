@@ -364,9 +364,8 @@ class PyreEnvironment(Environment):
         self._visited_cells.add((st.agent_x, st.agent_y))
 
         # Track closest approach to any exit for NearMissBonus
-        _exits = unblocked_exits(st.exit_positions, st.fire_grid, st.grid_w)
-        if not _exits:
-            _exits = st.exit_positions
+        _exits_reachable = unblocked_exits(st.exit_positions, st.fire_grid, st.grid_w)
+        _exits = _exits_reachable if _exits_reachable else st.exit_positions
         _cur_dist = bfs_exit_dist(st.agent_x, st.agent_y, _exits, st.cell_grid, st.grid_w, st.grid_h)
         if _cur_dist < self._min_exit_dist_reached:
             self._min_exit_dist_reached = _cur_dist
@@ -407,6 +406,12 @@ class PyreEnvironment(Environment):
         )
         obs_data["done"] = done
         obs_data["reward"] = reward
+
+        # Compute visible cells once so both metadata and map_state can use the count
+        _visible_set = compute_visible_cells(
+            st.agent_x, st.agent_y, st.cell_grid, st.smoke_grid, st.grid_w, st.grid_h,
+        ) if st.agent_alive and not st.agent_evacuated else set()
+
         obs_data["metadata"] = {
             "agent_health": st.agent_health,
             "step": st.step_count,
@@ -415,8 +420,12 @@ class PyreEnvironment(Environment):
             "fire_sources": st.fire_sources_count,
             "humidity": st.humidity,
             "difficulty": getattr(self, "_difficulty", "medium"),
+            # Fields consumed by ObservationEncoder global_features — previously missing
+            "nearest_exit_distance": _cur_dist,
+            "reachable_exit_count": len(_exits_reachable),
+            "visible_cell_count": len(_visible_set),
         }
-        obs_data["map_state"] = self._build_map_state(st)
+        obs_data["map_state"] = self._build_map_state(st, visible_set=_visible_set)
         return PyreObservation(**obs_data)
 
     @property
@@ -588,15 +597,22 @@ class PyreEnvironment(Environment):
     # Map state builder
     # ------------------------------------------------------------------
 
-    def _build_map_state(self, st: PyreState) -> PyreMapState:
-        """Assemble the full numerical grid snapshot for UI / visualization."""
+    def _build_map_state(self, st: PyreState, visible_set: Optional[set] = None) -> PyreMapState:
+        """Assemble the full numerical grid snapshot for UI / visualization.
+
+        Args:
+            visible_set: Pre-computed set of (x, y) visible cells. When provided
+                         (e.g. from step()) the second compute_visible_cells call
+                         is skipped. Pass None to compute fresh (used by reset()).
+        """
         if st.agent_alive and not st.agent_evacuated:
-            visible = compute_visible_cells(
-                st.agent_x, st.agent_y,
-                st.cell_grid, st.smoke_grid,
-                st.grid_w, st.grid_h,
-            )
-            visible_cells = [[x, y] for x, y in sorted(visible)]
+            if visible_set is None:
+                visible_set = compute_visible_cells(
+                    st.agent_x, st.agent_y,
+                    st.cell_grid, st.smoke_grid,
+                    st.grid_w, st.grid_h,
+                )
+            visible_cells = [[x, y] for x, y in sorted(visible_set)]
         else:
             visible_cells = []
 

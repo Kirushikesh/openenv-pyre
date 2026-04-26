@@ -6,8 +6,8 @@ The environment composes them by calling each rubric each step.
 
 Per-step rubrics:
   TimeStepPenalty            -0.01      constant time pressure
-  ProgressReward             +0.1       agent moved closer to nearest unblocked exit (BFS distance)
-  ProgressRegressionPenalty  -0.05      agent moved farther from nearest exit (symmetric gradient)
+  ProgressReward             +0.25      agent moved closer to nearest unblocked exit (BFS distance)
+  ProgressRegressionPenalty  -0.15      agent moved farther from nearest exit (symmetric gradient)
   SafeProgressBonus          +0.05      stacks on ProgressReward when progress made through smoke-free cell
   DangerPenalty              -0.5       agent moved into smoke≥moderate or fire-adjacent cell
   HealthDrainPenalty         -0.02×dmg  proportional to health lost this step
@@ -114,6 +114,8 @@ class ProgressReward:
 
     Uses BFS traversal distance (respects walls and obstacles) instead of
     Manhattan distance, so only genuine navigational progress is rewarded.
+    Value raised to +0.25 to create a stronger pull toward exits relative to
+    the danger/loop penalties that push the agent away from threats.
     """
 
     def score(
@@ -134,7 +136,7 @@ class ProgressReward:
             exits = exit_positions  # all blocked — still try to reward progress
         prev_dist = _bfs_exit_dist(prev_agent_x, prev_agent_y, exits, cell_grid, w, h)
         new_dist = _bfs_exit_dist(agent_x, agent_y, exits, cell_grid, w, h)
-        return 0.15 if new_dist < prev_dist else 0.0
+        return 0.25 if new_dist < prev_dist else 0.0
 
 
 class DangerPenalty:
@@ -219,8 +221,9 @@ class StrategicDoorBonus:
 class ProgressRegressionPenalty:
     """Penalise moving farther from the nearest unblocked exit.
 
-    Symmetric counterpart to ProgressReward: the agent gets +0.1 for progress
-    and –0.05 for regression, creating a clean two-sided gradient.
+    Symmetric counterpart to ProgressReward: the agent gets +0.25 for progress
+    and –0.15 for regression, creating a strong two-sided gradient that
+    discourages wandering away from the exit under fire pressure.
     """
 
     def score(
@@ -241,7 +244,7 @@ class ProgressRegressionPenalty:
             exits = exit_positions
         prev_dist = bfs_exit_dist(prev_agent_x, prev_agent_y, exits, cell_grid, w, h)
         new_dist = bfs_exit_dist(agent_x, agent_y, exits, cell_grid, w, h)
-        return -0.05 if new_dist > prev_dist else 0.0
+        return -0.15 if new_dist > prev_dist else 0.0
 
 
 class SafeProgressBonus:

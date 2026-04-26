@@ -173,11 +173,18 @@ def build_action_mask(observation: PyreObservation, exclude_look: bool = True) -
         grid via map_state — look gives zero new information but wastes a step
         and earns no reward. Excluding it concentrates the policy on moves and
         doors, which are the only actions that can improve the agent's position.
+
+    NOTE: Look action indices are 4–7 in ACTION_KEYS. The guard below must be
+    applied in the ACTION_TO_INDEX fast-path as well as the regex fallback,
+    because look hint strings exactly match ACTION_TO_INDEX keys and would
+    otherwise bypass the exclude_look flag entirely.
     """
     mask = np.zeros(ACTION_DIM, dtype=np.float32)
     for hint in observation.available_actions_hint:
         idx = ACTION_TO_INDEX.get(hint)
         if idx is not None:
+            if exclude_look and 4 <= idx <= 7:  # indices 4-7 are look(north/south/west/east)
+                continue
             mask[idx] = 1.0
             continue
         m = _MOVE_RE.fullmatch(hint)
@@ -568,6 +575,22 @@ def run_episode(
                     reward -= 0.2  # break the loop
                 recent_positions.append(cur_pos)
 
+            # ----------------------------------------------------------------
+            # Reward shaping 4 — exit proximity pull
+            # Absolute (not just delta) distance-based bonus so the agent has
+            # a continuous gradient toward exits even before it learns
+            # consistent BFS progress.  Complements the server-side
+            # ProgressReward which only fires on a single step of BFS gain.
+            # Max +0.25 when adjacent; tapers to 0 beyond 6 cells (Manhattan).
+            # Only fires on move to avoid rewarding standing still near exits.
+            # ----------------------------------------------------------------
+            if ms_next is not None and chosen_action.startswith("move") and not next_obs.agent_evacuated:
+                ax, ay = ms_next.agent_x, ms_next.agent_y
+                exits = ms_next.exit_positions  # List[List[int]] of [x, y]
+                if exits:
+                    min_manhattan = min(abs(ax - ex[0]) + abs(ay - ex[1]) for ex in exits)
+                    reward += max(0.0, 0.25 - 0.04 * min_manhattan)
+
             done = bool(next_obs.done)
 
             buffer.obs.append(state_vec)
@@ -875,6 +898,29 @@ def build_curriculum(schedule_str: str, n_episodes: int) -> List[str]:
     return schedule[:n_episodes]
 
 
+def parse_mix_dist(spec: Optional[str]) -> Optional[Dict[str, float]]:
+    """Parse a 'hard:0.6,medium:0.3,easy:0.1' style spec into a dict.
+
+    Returns None when ``spec`` is falsy. Probabilities are renormalised to
+    sum to 1 if they don't already (within 1% tolerance).
+    """
+    if not spec:
+        return None
+    out: Dict[str, float] = {}
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"Invalid mix-dist entry '{chunk}', expected 'name:prob'")
+        name, val = chunk.split(":", 1)
+        out[name.strip().lower()] = float(val)
+    total = sum(out.values())
+    if total <= 0:
+        raise ValueError(f"mix-dist probabilities must be positive, got {out}")
+    return {k: v / total for k, v in out.items()}
+
+
 class PatienceCurriculum:
     """Dynamic difficulty scheduler that gates advancement on sustained success rate.
 
@@ -888,7 +934,13 @@ class PatienceCurriculum:
         stages:           ordered list of difficulty strings, e.g. ['easy','medium','hard']
         threshold:        minimum success rate (0–1) required before advancing
         patience_window:  number of consecutive episodes that must meet threshold
-        mix_ratio:        fraction of hard-phase episodes to run on medium instead (0–1)
+        mix_ratio:        fraction of hard-phase episodes to run on medium instead (0–1).
+                          Ignored when ``mix_dist`` is provided.
+        mix_dist:         optional dict mapping difficulty -> probability used
+                          during the *final* (hard) stage, e.g.
+                          ``{"hard": 0.6, "medium": 0.3, "easy": 0.1}``. When set,
+                          each hard-phase episode samples its difficulty from this
+                          distribution. Probabilities must sum to 1.
     """
 
     def __init__(
@@ -897,13 +949,27 @@ class PatienceCurriculum:
         threshold: float,
         patience_window: int,
         mix_ratio: float = 0.0,
+        mix_dist: Optional[Dict[str, float]] = None,
     ) -> None:
         self.stages = stages
         self.threshold = threshold
         self.patience_window = patience_window
         self.mix_ratio = mix_ratio
+        self.mix_dist = mix_dist
         self.stage_idx = 0
         self._streak = 0
+
+        if self.mix_dist is not None:
+            total = sum(self.mix_dist.values())
+            if not (0.99 <= total <= 1.01):
+                raise ValueError(
+                    f"mix_dist probabilities must sum to 1, got {total:.3f}"
+                )
+            for k in self.mix_dist:
+                if k not in self.stages:
+                    raise ValueError(
+                        f"mix_dist key '{k}' not in stages {self.stages}"
+                    )
 
     @property
     def current(self) -> str:
@@ -913,7 +979,7 @@ class PatienceCurriculum:
         """Call once per episode *after* appending to success_window.
 
         Returns the difficulty to use for the *next* episode.
-        Also handles the hard-phase medium-mix injection.
+        Also handles the final-stage cumulative-replay mix.
         """
         if self.stage_idx < len(self.stages) - 1:
             if success_rate_30 >= self.threshold:
@@ -929,11 +995,18 @@ class PatienceCurriculum:
                     f"for {self.patience_window} eps)"
                 )
 
-        # Hard-phase mix: occasionally replay medium to prevent forgetting
-        if self.current == "hard" and self.mix_ratio > 0.0 and len(self.stages) >= 2:
+        is_final_stage = self.stage_idx == len(self.stages) - 1
+
+        if is_final_stage and self.mix_dist is not None:
+            keys = list(self.mix_dist.keys())
+            probs = np.array([self.mix_dist[k] for k in keys], dtype=np.float64)
+            probs = probs / probs.sum()
+            return str(np.random.choice(keys, p=probs))
+
+        if is_final_stage and self.mix_ratio > 0.0 and len(self.stages) >= 2:
             prev = self.stages[self.stage_idx - 1]
             if np.random.rand() < self.mix_ratio:
-                return prev  # medium replay episode
+                return prev
         return self.current
 
 
@@ -1019,13 +1092,17 @@ def train(args: argparse.Namespace) -> None:
     # Build curriculum — patience-gated (dynamic) or static
     stages = [s.strip().lower() for s in args.difficulty_schedule.split(",") if s.strip()]
     if args.patience_threshold > 0:
+        mix_dist = parse_mix_dist(getattr(args, "hard_mix_dist", None))
         patience_curriculum = PatienceCurriculum(
             stages=stages,
             threshold=args.patience_threshold,
             patience_window=args.patience_window,
             mix_ratio=args.hard_mix_ratio,
+            mix_dist=mix_dist,
         )
         static_curriculum: Optional[List[str]] = None
+        if mix_dist is not None:
+            print(f"[curriculum] hard-phase mix distribution: {mix_dist}")
         print(f"[curriculum] patience-gated: threshold={args.patience_threshold}  "
               f"window={args.patience_window}  mix={args.hard_mix_ratio}")
     else:
@@ -1204,7 +1281,11 @@ def parse_args() -> argparse.Namespace:
                    help="Episodes that must sustain >= patience-threshold before advancing.")
     p.add_argument("--hard-mix-ratio", type=float, default=0.25,
                    help="Fraction of hard-phase episodes to replay on medium (0=pure hard). "
-                        "Prevents catastrophic forgetting of the medium policy.")
+                        "Prevents catastrophic forgetting of the medium policy. "
+                        "Ignored when --hard-mix-dist is set.")
+    p.add_argument("--hard-mix-dist", type=str, default=None,
+                   help="Cumulative replay distribution for the final stage, e.g. "
+                        "'hard:0.6,medium:0.3,easy:0.1'. Overrides --hard-mix-ratio.")
     p.add_argument("--eval-difficulty", type=str, default="medium", choices=DIFFICULTIES)
     p.add_argument("--eval-episodes", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=50)
