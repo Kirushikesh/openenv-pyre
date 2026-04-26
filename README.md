@@ -20,7 +20,7 @@ tags:
 🔥 [Live Space](https://krooz-pyre-env.hf.space) &nbsp;|&nbsp;
 🤖 [Trained Model](https://huggingface.co/Krooz/pyre-ppo-agent) &nbsp;|&nbsp;
 📓 [Colab Training](https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing) &nbsp;|&nbsp;
-📝 [Blog](BLOG.md)
+📝 [Blog](https://huggingface.co/spaces/Krooz/pyre_env/blob/main/BLOG.md)
 
 ---
 
@@ -436,6 +436,28 @@ uv run python training/push_to_hub.py \
 ```
 
 Uploads `{stem}.pt`, `{stem}.csv`, `{stem}.png`, `{stem}_eval.csv`, and generates a model card README. The script’s embedded summary targets the **`pyre_ppo_hard_v2`** HTTP run; adjust `--stem` if you use a different checkpoint prefix. Trained weights: **[Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent)**.
+
+### 4. GRPO + Unsloth / TRL (LLM fine-tuning)
+
+Two scripts in `training/grpo/` fine-tune a language model directly on Pyre episode rollouts using GRPO:
+
+| Script | Stack | Notes |
+|---|---|---|
+| `train_grpo_unsloth.py` | Unsloth + vLLM + LoRA | Memory-efficient; `FastLanguageModel`, `adamw_8bit`, `model.fast_generate` |
+| `train_grpo_openenv.py` | HuggingFace TRL + LoRA | Mirrors the OpenEnv reference pipeline; same environment, prompts, and reward functions |
+
+Both scripts run `PyreEnvironment` in-process (no server required) and use multi-turn episode rollouts with `<think>…</think>` + JSON action completions. Switch models via `--model-id` (e.g. `unsloth/Qwen3-1.7B`, `unsloth/Qwen3-4B`).
+
+```bash
+# Unsloth path
+uv sync --extra train-unsloth
+python training/grpo/train_grpo_unsloth.py --model-id unsloth/Qwen3-1.7B --dataset-size 500
+
+# TRL path
+python training/grpo/train_grpo_openenv.py
+```
+
+---
 
 ### Training results
 
