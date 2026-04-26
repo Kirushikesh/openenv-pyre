@@ -22,13 +22,6 @@ Differences vs. the reference are intentional and limited to:
      Everything else (lr, grad_accum, num_generations, vllm colocate, trackio,
      push_to_hub) matches the reference notebook.
 
-  4. The reward signal is NOT passed to the model during training.  Evals-mode
-     (`evals.py`) appends `reward: {r:+.3f}` to each history step and includes a
-     "REWARD SIGNAL" section in the system prompt so an untrained model can use
-     the signal as a hint.  During GRPO training the model must learn from the
-     reward functions alone — leaking the reward into the prompt would contaminate
-     the gradient signal.
-
 Usage
 ─────
   python train_grpo_openenv.py
@@ -53,7 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 import torch
@@ -82,6 +75,25 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("grpo_openenv")
+
+# ── rollout trace file ────────────────────────────────────────────────────────
+_rollout_file: Optional[Any] = None
+_batch_counter: int = 0
+
+
+def _init_rollout_file(output_dir: str) -> None:
+    """Open {output_dir}/rollout_traces.log for appending plain text."""
+    global _rollout_file
+    log_path = Path(output_dir) / "rollout_traces.log"
+    _rollout_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    log.info("Rollout trace file → %s", log_path)
+
+
+def _rlog(msg: str = "") -> None:
+    """Write one line to the rollout trace file (no-op before init)."""
+    if _rollout_file is not None:
+        _rollout_file.write(msg + "\n")
+        _rollout_file.flush()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,12 +135,9 @@ ENVIRONMENT RULES
 - Exits may be BLOCKED if fire burns directly on them — check available hints.
 
 OUTPUT FORMAT (STRICT)
-You MUST reason inside <think>...</think> tags first, then emit EXACTLY ONE JSON object.
-Output NOTHING else — no extra text, no markdown fences, no second JSON block.
+Emit EXACTLY ONE JSON object and nothing else — no extra text, no markdown fences,
+no second JSON block.
 
-<think>
-Brief reasoning: what can I see, where is danger, what is the safest next move?
-</think>
 {"action": "move", "direction": "north"}
 
 AVAILABLE ACTIONS
@@ -236,14 +245,13 @@ def parse_action(text: str) -> Tuple[Dict[str, Any], float]:
     """Extract a Pyre action from raw LLM text.
 
     Returns (action_dict, format_score):
-      1.0  — valid JSON + <think> tags
-      0.7  — valid JSON, no <think>
+      1.0  — valid JSON with all required fields
+      0.4  — valid JSON but incomplete action (e.g. look missing direction);
+             recovered with a safe default
       0.4  — partial JSON rescued via regex
       0.1  — action keyword found in raw text (last resort)
       0.0  — completely unparseable → {"action": "wait"} fallback
     """
-    has_think = "<think>" in text and "</think>" in text
-
     start = text.find("{")
     end   = text.rfind("}")
     if start != -1 and end > start:
@@ -252,7 +260,10 @@ def parse_action(text: str) -> Tuple[Dict[str, Any], float]:
             if isinstance(blob, dict):
                 action = _validate_pyre_action(blob)
                 if action is not None:
-                    return action, (1.0 if has_think else 0.7)
+                    return action, 1.0
+                # Valid JSON but incomplete — recover look with a default direction
+                if blob.get("action", "").strip().lower() == "look":
+                    return {"action": "look", "direction": "north"}, 0.4
         except json.JSONDecodeError:
             pass
 
@@ -299,24 +310,29 @@ def rollout_once(
     max_turns: int,
     difficulty: str,
     seed: int,
+    episode_num: int = 0,
 ) -> Dict[str, Any]:
     """Execute one full Pyre episode using generate_rollout_completions.
 
     Uses PyreEnv.sync() (WebSocket context) so the session persists across all
     steps of the episode — identical semantics to WorldState in the reference.
     """
-    prompt_ids:     List[int]   = []
-    completion_ids: List[int]   = []
-    logprobs:       List        = []
-    step_rewards:   List[float] = []
-    history:        List[str]   = []
-    agent_evacuated: bool       = False
-    final_health:    float      = 0.0
-    done:            bool       = False
-    steps_taken:     int        = 0
-    think_steps:     int        = 0
+    prompt_ids:      List[int]   = []
+    completion_ids:  List[int]   = []
+    logprobs:        List        = []
+    step_rewards:    List[float] = []
+    history:         List[str]   = []
+    agent_evacuated: bool        = False
+    final_health:    float       = 0.0
+    done:            bool        = False
+    steps_taken:     int         = 0
+    valid_json_steps: int        = 0  # steps where fmt_score >= 0.7 (clean JSON)
 
     MAX_TOK_ACCUM = 8192
+
+    _rlog("=" * 72)
+    _rlog(f"  BATCH {_batch_counter}  |  EPISODE {episode_num}  |  difficulty={difficulty}  |  seed={seed}")
+    _rlog("=" * 72)
 
     try:
         env  = PyreEnvironment()
@@ -334,24 +350,16 @@ def rollout_once(
                 {"role": "user",   "content": user_prompt},
             ]
 
-            try:
-                prompt_text = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    enable_thinking=True,
-                )
-            except TypeError:
-                prompt_text = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                )
-
-            log.debug(
-                "\n[difficulty=%s seed=%d step=%d] ── PROMPT ──────────────────────────\n%s\n────────────────────────────────────",
-                difficulty, seed, _turn + 1, prompt_text,
+            prompt_text = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=False,
             )
+
+            _rlog(f"\n── STEP {_turn + 1} " + "─" * (64 - len(str(_turn + 1))))
+            _rlog("[PROMPT]")
+            _rlog(prompt_text)
 
             rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
             prompt_ids.extend(rollout_outputs["prompt_ids"])
@@ -361,17 +369,15 @@ def rollout_once(
                 rollout_outputs["completion_ids"], skip_special_tokens=False
             )
 
-            log.debug(
-                "\n[difficulty=%s seed=%d step=%d] ── COMPLETION ──────────────────────\n%s\n────────────────────────────────────",
-                difficulty, seed, _turn + 1, completion_text,
-            )
+            _rlog("\n[COMPLETION]")
+            _rlog(completion_text)
 
-            if "<think>" in completion_text and "</think>" in completion_text:
-                think_steps += 1
             steps_taken += 1
 
             action_dict, fmt_score = parse_action(completion_text)
             fmt_penalty = (1.0 - fmt_score) * -0.10
+            if fmt_score >= 0.7:
+                valid_json_steps += 1
 
             obs         = env.step(PyreAction(**action_dict))
             step_reward = float(obs.reward or 0.0)
@@ -380,7 +386,11 @@ def rollout_once(
             step_rewards.append(step_reward + fmt_penalty)
 
             feedback = obs.last_action_feedback or ""
-            # Reward is intentionally excluded from the history entry.
+            _rlog(f"\n[ACTION]   {json.dumps(action_dict)}  |  fmt_score={fmt_score:.2f}  |  fmt_penalty={fmt_penalty:+.3f}")
+            _rlog(f"[REWARD]   step_reward={step_reward:+.4f}  |  total={step_reward + fmt_penalty:+.4f}  |  health={obs.agent_health:.1f}  |  done={done}")
+            if feedback:
+                _rlog(f"[FEEDBACK] {feedback}")
+
             history.append(
                 f"Step {_turn + 1}: {json.dumps(action_dict)}"
                 + (f"\n  → {feedback}" if feedback else "")
@@ -392,6 +402,8 @@ def rollout_once(
 
     except Exception as exc:
         log.error("Episode failed (difficulty=%s seed=%d): %s", difficulty, seed, exc)
+        _rlog(f"\n[ERROR] Episode crashed: {exc}")
+        _rlog("=" * 72)
         return {
             "prompt_ids":       [],
             "completion_ids":   [],
@@ -405,8 +417,17 @@ def rollout_once(
         }
 
     mean_step_reward = sum(step_rewards) / max(len(step_rewards), 1)
-    format_rate      = think_steps / max(steps_taken, 1)
+    format_rate      = valid_json_steps / max(steps_taken, 1)
     meta             = DIFFICULTY_REGISTRY[difficulty]
+
+    outcome = "EVACUATED" if agent_evacuated else "failed"
+    _rlog(f"\n── RESULT " + "─" * 62)
+    _rlog(
+        f"[{outcome}]  health={final_health:.1f}  |  steps={steps_taken}"
+        f"  |  mean_step={mean_step_reward:+.4f}  |  fmt={format_rate * 100:.0f}%"
+        f"  |  valid_json_steps={valid_json_steps}"
+    )
+    _rlog("=" * 72)
 
     return {
         "prompt_ids":       prompt_ids,
@@ -423,6 +444,9 @@ def rollout_once(
 
 def rollout_func(prompts, trainer=None):
     """Called by GRPOTrainer once per training batch."""
+    global _batch_counter
+    _batch_counter += 1
+
     episode_prompt_ids:     List[List[int]]   = []
     episode_completion_ids: List[List[int]]   = []
     episode_logprobs:       List[List[float]] = []
@@ -451,6 +475,7 @@ def rollout_func(prompts, trainer=None):
             max_turns=meta.max_steps,
             difficulty=difficulty,
             seed=seed,
+            episode_num=i + 1,
         )
 
         episode_prompt_ids.append(episode["prompt_ids"])
@@ -471,6 +496,18 @@ def rollout_func(prompts, trainer=None):
             episode["steps_taken"],
             episode["format_rate"] * 100,
         )
+
+    # Log episode-level metrics to TensorBoard so they appear alongside TRL's
+    # reward scalars rather than being hidden inside kwargs.
+    if trainer is not None and hasattr(trainer, "log"):
+        n = len(evacuated_list)
+        trainer.log({
+            "rollout/evacuated_rate":    sum(evacuated_list) / max(n, 1),
+            "rollout/mean_steps_taken":  sum(steps_taken_list) / max(n, 1),
+            "rollout/mean_final_health": sum(final_health_list) / max(n, 1),
+            "rollout/mean_format_rate":  sum(format_rates) / max(n, 1),
+            "rollout/mean_step_reward":  sum(step_reward_means) / max(n, 1),
+        })
 
     return {
         "prompt_ids":       episode_prompt_ids,
@@ -505,7 +542,7 @@ def reward_step_efficiency(completions, **kwargs):
 
 
 def reward_format(completions, **kwargs):
-    """+0.10 bonus when the model uses <think> tags on ≥50% of steps."""
+    """+0.10 bonus when the model produces clean JSON (fmt_score ≥ 0.7) on ≥50% of steps."""
     rates = kwargs.get("format_rate") or [0.0] * len(completions)
     return [0.10 if float(r) >= 0.5 else 0.0 for r in rates]
 
@@ -544,8 +581,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-size", type=int, default=1000)
     p.add_argument("--output-dir",   default="./outputs/grpo_pyre_easy")
     p.add_argument("--push-to-hub",  action="store_true")
-    p.add_argument("--debug",        action="store_true",
-                   help="Log full prompt and completion text for each step")
     p.add_argument("--report-to",    default="trackio",
                    choices=["trackio", "tensorboard", "none"])
     p.add_argument("--seed",         type=int, default=42)
@@ -556,9 +591,8 @@ if __name__ == "__main__":
     args = parse_args()
     random.seed(args.seed)
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        log.debug("Debug logging enabled — full prompt/completion will be printed each step.")
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    _init_rollout_file(args.output_dir)
 
     # ── Init tokenizer ──────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
@@ -582,7 +616,7 @@ if __name__ == "__main__":
     # gradient checkpointing, push_to_hub — is identical to the reference.
     grpo_config = GRPOConfig(
         model_init_kwargs={
-            "torch_dtype": "bfloat16",
+            "dtype": "bfloat16",  # torch_dtype is deprecated; dtype ensures bfloat16 is actually applied
             "attn_implementation": "flash_attention_2",
         },
         num_train_epochs=1,
@@ -590,17 +624,18 @@ if __name__ == "__main__":
         gradient_accumulation_steps=8,
         per_device_train_batch_size=1,
         warmup_steps=20,
-        num_generations=4,
+        num_generations=2,
         max_completion_length=1024,
         use_vllm=True,
         vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.3,
-        vllm_max_model_length=8192,
+        vllm_gpu_memory_utilization=0.25,  # reduced from 0.3 to leave more headroom for backward pass
+        vllm_max_model_length=4096,
         output_dir=args.output_dir,
         report_to=args.report_to,
         trackio_space_id=args.output_dir if args.report_to == "trackio" else None,
         logging_steps=1,
         save_steps=10,
+        save_total_limit=1,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         push_to_hub=args.push_to_hub,
