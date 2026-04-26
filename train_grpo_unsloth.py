@@ -1,35 +1,26 @@
 """
-train_grpo_openenv.py — GRPO + LoRA training for Pyre
-                        (PyreEnvironment in-process, OpenEnv notebook-style pipeline)
+train_grpo_unsloth.py — GRPO + LoRA training for Pyre via Unsloth
+                         (PyreEnvironment in-process, multi-turn episode rollout)
 
-Mirrors train_grpo_openenv.py from the reference as closely as possible.
-Differences vs. the reference are intentional and limited to:
+Mirrors train_grpo_openenv.py but replaces the TRL-native stack with:
+  • FastLanguageModel  — memory-efficient model loading + LoRA
+  • model.fast_generate — vLLM-backed generation inside the episode rollout
+  • adamw_8bit / cosine schedule — Unsloth-recommended training config
+  • model.save_lora / save_pretrained_merged — Unsloth save API
 
-  1. Environment is PyreEnvironment, called in-process (no server needed).
-     The reference calls WorldState in-process; Pyre uses the same approach —
-     PyreEnvironment is instantiated directly, so no `uv run server` is required.
-
-  2. Pyre is a single-environment, difficulty-parametrised task.  For this initial
-     training run we fix difficulty to "easy" only (1 fire source, slow spread,
-     calm wind, high humidity) — the clearest training signal before adding harder
-     difficulties.  The stratified-mix infrastructure is kept so additional levels
-     can be added by expanding DIFFICULTY_REGISTRY and DIFFICULTY_WEIGHTS.
-
-  3. Prompt & completion lengths are similar to the reference:
-       - Pyre observations are first-person narrative (~200-300 tokens per step).
-       - Outputs are <think>…</think> + one small JSON action → up to ~512 tokens.
-     We use max_completion_length=512 (action JSON is tiny vs. IAM tool calls).
-     Everything else (lr, grad_accum, num_generations, vllm colocate, trackio,
-     push_to_hub) matches the reference notebook.
+Everything else (environment, prompts, reward functions, rollout structure) is
+identical to the TRL version so the two scripts stay directly comparable.
 
 Usage
 ─────
-  python train_grpo_openenv.py
-  python train_grpo_openenv.py --model-id Qwen/Qwen3-1.7B --dataset-size 1000
+  python train_grpo_unsloth.py
+  python train_grpo_unsloth.py --model-id unsloth/Qwen3-1.7B --dataset-size 1000
+  python train_grpo_unsloth.py --model-id unsloth/Qwen3-4B --lora-rank 32 --save-merged
 
 Dependencies
 ────────────
-  uv sync   (installs trl, transformers, datasets, openenv-core, etc.)
+  uv sync --extra train-unsloth
+  (installs unsloth, vllm, trl, datasets, etc.)
 """
 
 from __future__ import annotations
@@ -46,14 +37,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
 
 import torch
 from datasets import Dataset
-from transformers import AutoTokenizer
 from trl import GRPOConfig, GRPOTrainer
-from trl.experimental.openenv import generate_rollout_completions
+from unsloth import FastLanguageModel
+from vllm import SamplingParams
 
 try:
     from dotenv import load_dotenv
@@ -61,7 +52,6 @@ try:
 except ImportError:
     pass
 
-# PyreEnv client — imported from the same package
 _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -74,53 +64,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("grpo_openenv")
-
-# ── rollout trace file ────────────────────────────────────────────────────────
-_rollout_file: Optional[Any] = None
-_batch_counter: int = 0
-
-
-def _init_rollout_file(output_dir: str) -> None:
-    """Open {output_dir}/rollout_traces.log for appending plain text."""
-    global _rollout_file
-    log_path = Path(output_dir) / "rollout_traces.log"
-    _rollout_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
-    log.info("Rollout trace file → %s", log_path)
-
-
-def _rlog(msg: str = "") -> None:
-    """Write one line to the rollout trace file (no-op before init)."""
-    if _rollout_file is not None:
-        _rollout_file.write(msg + "\n")
-        _rollout_file.flush()
+log = logging.getLogger("grpo_unsloth")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. Difficulty registry + stratified mix (notebook "cell-1" analogue)
+# 1. Difficulty registry + stratified mix
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DifficultyMeta:
     difficulty: str
     max_steps: int
-    optimal_steps: int   # H* — used by reward_efficiency
+    optimal_steps: int
 
 
 DIFFICULTY_REGISTRY: Dict[str, DifficultyMeta] = {
-    # Only "easy" for this initial training run.
-    # Add "medium" / "hard" here and update DIFFICULTY_WEIGHTS to scale up.
     "easy": DifficultyMeta("easy", max_steps=200, optimal_steps=50),
 }
 
-# Stratified mix — weights must sum to 1.0.
 DIFFICULTY_WEIGHTS: Dict[str, float] = {
     "easy": 1.0,
 }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. System prompt  (reward signal intentionally omitted — see module docstring)
+# 2. System prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
 system_prompt = textwrap.dedent("""
@@ -135,9 +103,12 @@ ENVIRONMENT RULES
 - Exits may be BLOCKED if fire burns directly on them — check available hints.
 
 OUTPUT FORMAT (STRICT)
-Emit EXACTLY ONE JSON object and nothing else — no extra text, no markdown fences,
-no second JSON block.
+You MUST reason inside <think>...</think> tags first, then emit EXACTLY ONE JSON object.
+Output NOTHING else — no extra text, no markdown fences, no second JSON block.
 
+<think>
+Brief reasoning: what can I see, where is danger, what is the safest next move?
+</think>
 {"action": "move", "direction": "north"}
 
 AVAILABLE ACTIONS
@@ -155,28 +126,22 @@ STRATEGY TIPS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Helper functions (notebook "cell-10" analogue)
+# 3. Prompt helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_user_prompt(obs: Dict[str, Any], history: List[str]) -> str:
-    """Build the user turn from the current PyreObservation dict + history.
-
-    Reward is intentionally excluded from both the header and history entries.
-    The model must learn from GRPO reward functions, not from in-prompt leakage.
-    """
+    """Build the user turn from the current PyreObservation dict + action history."""
     narrative = obs.get("narrative", "(no narrative)")
-    # Strip the "Available actions:" line the narrative builder appends —
-    # the system prompt already documents the full action schema.
     narrative = re.sub(r"\nAvailable actions:.*$", "", narrative, flags=re.MULTILINE)
 
-    health       = obs.get("agent_health", 0.0)
-    health_st    = obs.get("health_status", "?")
-    location     = obs.get("location_label", "?")
-    smoke        = obs.get("smoke_level", "none")
-    fire_vis     = obs.get("fire_visible", False)
-    fire_dir     = obs.get("fire_direction") or "none"
-    wind         = obs.get("wind_dir", "CALM")
-    elapsed      = obs.get("elapsed_steps", 0)
+    health        = obs.get("agent_health", 0.0)
+    health_st     = obs.get("health_status", "?")
+    location      = obs.get("location_label", "?")
+    smoke         = obs.get("smoke_level", "none")
+    fire_vis      = obs.get("fire_visible", False)
+    fire_dir      = obs.get("fire_direction") or "none"
+    wind          = obs.get("wind_dir", "CALM")
+    elapsed       = obs.get("elapsed_steps", 0)
     blocked_exits = obs.get("blocked_exit_ids", [])
     visible_objs  = obs.get("visible_objects", [])
     audible       = obs.get("audible_signals", [])
@@ -245,13 +210,14 @@ def parse_action(text: str) -> Tuple[Dict[str, Any], float]:
     """Extract a Pyre action from raw LLM text.
 
     Returns (action_dict, format_score):
-      1.0  — valid JSON with all required fields
-      0.4  — valid JSON but incomplete action (e.g. look missing direction);
-             recovered with a safe default
+      1.0  — valid JSON + <think> tags
+      0.7  — valid JSON, no <think>
       0.4  — partial JSON rescued via regex
       0.1  — action keyword found in raw text (last resort)
       0.0  — completely unparseable → {"action": "wait"} fallback
     """
+    has_think = "<think>" in text and "</think>" in text
+
     start = text.find("{")
     end   = text.rfind("}")
     if start != -1 and end > start:
@@ -260,10 +226,7 @@ def parse_action(text: str) -> Tuple[Dict[str, Any], float]:
             if isinstance(blob, dict):
                 action = _validate_pyre_action(blob)
                 if action is not None:
-                    return action, 1.0
-                # Valid JSON but incomplete — recover look with a default direction
-                if blob.get("action", "").strip().lower() == "look":
-                    return {"action": "look", "direction": "north"}, 0.4
+                    return action, (1.0 if has_think else 0.7)
         except json.JSONDecodeError:
             pass
 
@@ -295,44 +258,47 @@ def parse_action(text: str) -> Tuple[Dict[str, Any], float]:
     return dict(_FALLBACK_ACTION), 0.0
 
 
-print("Helper functions defined.")
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Module-level generation objects
+#    Populated in __main__ once the tokenizer eos_token is known.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# model and tokenizer are set as module-level globals in __main__ so that
+# rollout_once (called inside rollout_func, which is called by GRPOTrainer)
+# can reach them without threading them through every call frame.
+model = None
+tokenizer = None
+
+VLLM_SAMPLING_PARAMS: Optional[SamplingParams] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Rollout function (notebook "cell-12" analogue)
+# 5. Rollout function
 # ─────────────────────────────────────────────────────────────────────────────
 
 def rollout_once(
-    trainer: GRPOTrainer,
-    tokenizer,
     dataset_prompt: str,
-    system_prompt: str,
     max_turns: int,
     difficulty: str,
     seed: int,
-    episode_num: int = 0,
 ) -> Dict[str, Any]:
-    """Execute one full Pyre episode using generate_rollout_completions.
+    """Execute one full Pyre episode using Unsloth's model.fast_generate.
 
-    Uses PyreEnv.sync() (WebSocket context) so the session persists across all
-    steps of the episode — identical semantics to WorldState in the reference.
+    Generation is handled by model.fast_generate (Unsloth vLLM backend).
+    Token IDs are extracted directly from the vLLM RequestOutput so that
+    GRPOTrainer can compute the GRPO loss from them.
     """
-    prompt_ids:      List[int]   = []
-    completion_ids:  List[int]   = []
-    logprobs:        List        = []
-    step_rewards:    List[float] = []
-    history:         List[str]   = []
-    agent_evacuated: bool        = False
-    final_health:    float       = 0.0
-    done:            bool        = False
-    steps_taken:     int         = 0
-    valid_json_steps: int        = 0  # steps where fmt_score >= 0.7 (clean JSON)
+    prompt_ids:     List[int]   = []
+    completion_ids: List[int]   = []
+    step_rewards:   List[float] = []
+    history:        List[str]   = []
+    agent_evacuated: bool       = False
+    final_health:    float      = 0.0
+    done:            bool       = False
+    steps_taken:     int        = 0
+    think_steps:     int        = 0
 
     MAX_TOK_ACCUM = 8192
-
-    _rlog("=" * 72)
-    _rlog(f"  BATCH {_batch_counter}  |  EPISODE {episode_num}  |  difficulty={difficulty}  |  seed={seed}")
-    _rlog("=" * 72)
 
     try:
         env  = PyreEnvironment()
@@ -343,41 +309,52 @@ def rollout_once(
             if done or len(completion_ids) >= MAX_TOK_ACCUM:
                 break
 
-            obs_dict = obs.model_dump()
+            obs_dict    = obs.model_dump()
             user_prompt = make_user_prompt(obs_dict, history)
-            messages = [
+            messages    = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
             ]
 
-            prompt_text = tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=False,
+            try:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=True,
+                )
+            except TypeError:
+                prompt_text = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+
+            log.debug(
+                "\n[difficulty=%s seed=%d step=%d] ── PROMPT ──────────────────────────\n%s\n────────────────────────────────────",
+                difficulty, seed, _turn + 1, prompt_text,
             )
 
-            _rlog(f"\n── STEP {_turn + 1} " + "─" * (64 - len(str(_turn + 1))))
-            _rlog("[PROMPT]")
-            _rlog(prompt_text)
+            # ── Unsloth vLLM generation ─────────────────────────────────────
+            vllm_out        = model.fast_generate([prompt_text], sampling_params=VLLM_SAMPLING_PARAMS)[0]
+            completion_text = vllm_out.outputs[0].text
 
-            rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
-            prompt_ids.extend(rollout_outputs["prompt_ids"])
-            completion_ids.extend(rollout_outputs["completion_ids"])
-            logprobs.extend(rollout_outputs.get("logprobs") or [])
-            completion_text = rollout_outputs.get("text") or tokenizer.decode(
-                rollout_outputs["completion_ids"], skip_special_tokens=False
+            # Accumulate token IDs for GRPO loss computation
+            prompt_ids.extend(list(vllm_out.prompt_token_ids))
+            completion_ids.extend(list(vllm_out.outputs[0].token_ids))
+            # ────────────────────────────────────────────────────────────────
+
+            log.debug(
+                "\n[difficulty=%s seed=%d step=%d] ── COMPLETION ──────────────────────\n%s\n────────────────────────────────────",
+                difficulty, seed, _turn + 1, completion_text,
             )
 
-            _rlog("\n[COMPLETION]")
-            _rlog(completion_text)
-
+            if "<think>" in completion_text and "</think>" in completion_text:
+                think_steps += 1
             steps_taken += 1
 
             action_dict, fmt_score = parse_action(completion_text)
             fmt_penalty = (1.0 - fmt_score) * -0.10
-            if fmt_score >= 0.7:
-                valid_json_steps += 1
 
             obs         = env.step(PyreAction(**action_dict))
             step_reward = float(obs.reward or 0.0)
@@ -386,11 +363,6 @@ def rollout_once(
             step_rewards.append(step_reward + fmt_penalty)
 
             feedback = obs.last_action_feedback or ""
-            _rlog(f"\n[ACTION]   {json.dumps(action_dict)}  |  fmt_score={fmt_score:.2f}  |  fmt_penalty={fmt_penalty:+.3f}")
-            _rlog(f"[REWARD]   step_reward={step_reward:+.4f}  |  total={step_reward + fmt_penalty:+.4f}  |  health={obs.agent_health:.1f}  |  done={done}")
-            if feedback:
-                _rlog(f"[FEEDBACK] {feedback}")
-
             history.append(
                 f"Step {_turn + 1}: {json.dumps(action_dict)}"
                 + (f"\n  → {feedback}" if feedback else "")
@@ -402,8 +374,6 @@ def rollout_once(
 
     except Exception as exc:
         log.error("Episode failed (difficulty=%s seed=%d): %s", difficulty, seed, exc)
-        _rlog(f"\n[ERROR] Episode crashed: {exc}")
-        _rlog("=" * 72)
         return {
             "prompt_ids":       [],
             "completion_ids":   [],
@@ -417,22 +387,13 @@ def rollout_once(
         }
 
     mean_step_reward = sum(step_rewards) / max(len(step_rewards), 1)
-    format_rate      = valid_json_steps / max(steps_taken, 1)
+    format_rate      = think_steps / max(steps_taken, 1)
     meta             = DIFFICULTY_REGISTRY[difficulty]
-
-    outcome = "EVACUATED" if agent_evacuated else "failed"
-    _rlog(f"\n── RESULT " + "─" * 62)
-    _rlog(
-        f"[{outcome}]  health={final_health:.1f}  |  steps={steps_taken}"
-        f"  |  mean_step={mean_step_reward:+.4f}  |  fmt={format_rate * 100:.0f}%"
-        f"  |  valid_json_steps={valid_json_steps}"
-    )
-    _rlog("=" * 72)
 
     return {
         "prompt_ids":       prompt_ids,
         "completion_ids":   completion_ids,
-        "logprobs":         logprobs,
+        "logprobs":         [],       # fast_generate does not expose per-token logprobs
         "evacuated":        int(agent_evacuated),
         "final_health":     round(final_health, 2),
         "mean_step_reward": round(mean_step_reward, 4),
@@ -442,11 +403,8 @@ def rollout_once(
     }
 
 
-def rollout_func(prompts, trainer=None):
+def rollout_func(prompts, trainer=None):  # trainer kept for API compatibility, unused
     """Called by GRPOTrainer once per training batch."""
-    global _batch_counter
-    _batch_counter += 1
-
     episode_prompt_ids:     List[List[int]]   = []
     episode_completion_ids: List[List[int]]   = []
     episode_logprobs:       List[List[float]] = []
@@ -457,25 +415,21 @@ def rollout_func(prompts, trainer=None):
     optimal_steps_list:     List[int]         = []
     format_rates:           List[float]       = []
 
-    difficulty_ids = list(DIFFICULTY_WEIGHTS.keys())
+    difficulty_ids   = list(DIFFICULTY_WEIGHTS.keys())
     difficulty_probs = list(DIFFICULTY_WEIGHTS.values())
 
     for i, prompt_text in enumerate(prompts):
         difficulty = random.choices(difficulty_ids, weights=difficulty_probs, k=1)[0]
-        meta = DIFFICULTY_REGISTRY[difficulty]
-        seed = random.randint(0, 1_000_000)
+        meta       = DIFFICULTY_REGISTRY[difficulty]
+        seed       = random.randint(0, 1_000_000)
 
         log.info("Episode %d | difficulty=%s | seed=%d", i + 1, difficulty, seed)
 
         episode = rollout_once(
-            trainer=trainer,
-            tokenizer=tokenizer,
             dataset_prompt=prompt_text,
-            system_prompt=system_prompt,
             max_turns=meta.max_steps,
             difficulty=difficulty,
             seed=seed,
-            episode_num=i + 1,
         )
 
         episode_prompt_ids.append(episode["prompt_ids"])
@@ -497,18 +451,6 @@ def rollout_func(prompts, trainer=None):
             episode["format_rate"] * 100,
         )
 
-    # Log episode-level metrics to TensorBoard so they appear alongside TRL's
-    # reward scalars rather than being hidden inside kwargs.
-    if trainer is not None and hasattr(trainer, "log"):
-        n = len(evacuated_list)
-        trainer.log({
-            "rollout/evacuated_rate":    sum(evacuated_list) / max(n, 1),
-            "rollout/mean_steps_taken":  sum(steps_taken_list) / max(n, 1),
-            "rollout/mean_final_health": sum(final_health_list) / max(n, 1),
-            "rollout/mean_format_rate":  sum(format_rates) / max(n, 1),
-            "rollout/mean_step_reward":  sum(step_reward_means) / max(n, 1),
-        })
-
     return {
         "prompt_ids":       episode_prompt_ids,
         "completion_ids":   episode_completion_ids,
@@ -522,11 +464,8 @@ def rollout_func(prompts, trainer=None):
     }
 
 
-print("Rollout functions defined.")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. Reward functions (notebook "cell-14" analogue — 4 signals)
+# 6. Reward functions  (identical to TRL version)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def reward_evacuated(completions, **kwargs):
@@ -542,16 +481,16 @@ def reward_step_efficiency(completions, **kwargs):
 
 
 def reward_format(completions, **kwargs):
-    """+0.10 bonus when the model produces clean JSON (fmt_score ≥ 0.7) on ≥50% of steps."""
+    """+0.10 bonus when the model uses <think> tags on ≥50% of steps."""
     rates = kwargs.get("format_rate") or [0.0] * len(completions)
     return [0.10 if float(r) >= 0.5 else 0.0 for r in rates]
 
 
 def reward_efficiency(completions, **kwargs):
     """Step-efficiency bonus: +0.10 if evacuated within H* steps, decays beyond."""
-    steps_list  = kwargs.get("steps_taken")   or [0]   * len(completions)
-    optimal     = kwargs.get("optimal_steps") or [50]  * len(completions)
-    evacuated   = kwargs.get("evacuated")     or [0]   * len(completions)
+    steps_list = kwargs.get("steps_taken")   or [0]  * len(completions)
+    optimal    = kwargs.get("optimal_steps") or [50] * len(completions)
+    evacuated  = kwargs.get("evacuated")     or [0]  * len(completions)
     rewards = []
     for steps, h_star, evac in zip(steps_list, optimal, evacuated):
         if not int(evac):
@@ -565,86 +504,133 @@ def reward_efficiency(completions, **kwargs):
     return rewards
 
 
-print("Reward functions: evacuated, step_efficiency, format, efficiency")
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. CLI + main (notebook cells 6, 16, 18, 20, 22, 25 inline)
+# 7. CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="GRPO training for Pyre (easy difficulty), OpenEnv-notebook style",
+        description="GRPO + LoRA training for Pyre via Unsloth",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--model-id",     default="Qwen/Qwen3-1.7B")
-    p.add_argument("--dataset-size", type=int, default=1000)
-    p.add_argument("--output-dir",   default="./outputs/grpo_pyre_easy")
-    p.add_argument("--push-to-hub",  action="store_true")
-    p.add_argument("--report-to",    default="trackio",
+    # Model
+    p.add_argument("--model-id",               default="unsloth/Qwen3-1.7B")
+    p.add_argument("--lora-rank",              type=int,   default=32,
+                   help="LoRA rank r; lora_alpha is set to r*2")
+    p.add_argument("--load-in-4bit",           action="store_true",
+                   help="Load model in 4-bit (QLoRA). Default: 16-bit LoRA")
+    p.add_argument("--max-seq-length",         type=int,   default=8192)
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.7,
+                   help="Fraction of GPU memory reserved for vLLM")
+    # Training
+    p.add_argument("--dataset-size",           type=int,   default=1000)
+    p.add_argument("--output-dir",             default="./outputs/grpo_pyre_unsloth")
+    p.add_argument("--report-to",              default="tensorboard",
                    choices=["trackio", "tensorboard", "none"])
-    p.add_argument("--seed",         type=int, default=42)
+    p.add_argument("--seed",                   type=int,   default=42)
+    p.add_argument("--debug",                  action="store_true",
+                   help="Log full prompt and completion text for each step")
+    # Save / publish
+    p.add_argument("--save-merged",            action="store_true",
+                   help="After training, also save a merged 16-bit checkpoint")
+    p.add_argument("--push-to-hub",            action="store_true")
+    p.add_argument("--hub-repo",               default=None,
+                   help="HF repo id for push_to_hub_merged, e.g. 'user/model'")
     return p.parse_args()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     args = parse_args()
     random.seed(args.seed)
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    _init_rollout_file(args.output_dir)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    # ── Init tokenizer ──────────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    log.info("Model: %s", args.model_id)
+    # ── Load model + tokenizer via Unsloth ──────────────────────────────────
+    log.info("Loading model '%s' via FastLanguageModel …", args.model_id)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=args.model_id,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=args.load_in_4bit,
+        fast_inference=True,                     # activates Unsloth vLLM backend
+        max_lora_rank=args.lora_rank,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
+    log.info("Applying LoRA (r=%d, alpha=%d) …", args.lora_rank, args.lora_rank * 2)
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=args.lora_rank,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        lora_alpha=args.lora_rank * 2,
+        use_gradient_checkpointing="unsloth",    # Unsloth memory-efficient GC
+        random_state=args.seed,
+    )
 
-    # ── Create dataset ──────────────────────────────────────────────────────
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    log.info("Trainable params: %s / %s (%.2f%%)", f"{trainable:,}", f"{total:,}", trainable / total * 100)
+
+    # ── Wire up module-level sampling params ────────────────────────────────
+    # VLLM_SAMPLING_PARAMS, model, and tokenizer are declared as module-level
+    # globals above.  Assigning here (we are at module scope, not inside a
+    # function) updates those globals so rollout_once can reach them when
+    # GRPOTrainer calls rollout_func during training.
+    VLLM_SAMPLING_PARAMS = SamplingParams(
+        temperature=0.7,
+        top_p=0.9,
+        top_k=-1,
+        max_tokens=1024,
+        stop=[tokenizer.eos_token],
+        include_stop_str_in_output=True,
+        seed=args.seed,
+    )
+
+    # ── Dataset ─────────────────────────────────────────────────────────────
     dataset = Dataset.from_dict({
-        "prompt": ["Navigate the burning building and evacuate safely."] * args.dataset_size
+        "prompt": [
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": "Navigate the burning building and evacuate safely."},
+            ]
+        ] * args.dataset_size
     })
     log.info("Dataset: %d prompts", len(dataset))
 
-    # ── Configure GRPO ──────────────────────────────────────────────────────
-    #
-    # Matching the reference notebook, with one Pyre-specific override:
-    #
-    #   max_completion_length  512 → 1024   (safe margin for Qwen3 think + JSON action)
-    #
-    # Everything else — lr, grad_accum, num_generations, vLLM colocate,
-    # gradient checkpointing, push_to_hub — is identical to the reference.
+    # ── GRPOConfig — Unsloth style ──────────────────────────────────────────
     grpo_config = GRPOConfig(
-        model_init_kwargs={
-            "dtype": "bfloat16",  # torch_dtype is deprecated; dtype ensures bfloat16 is actually applied
-            "attn_implementation": "flash_attention_2",
-        },
-        num_train_epochs=1,
+        vllm_sampling_params=VLLM_SAMPLING_PARAMS,
+        temperature=0.7,
         learning_rate=5e-6,
-        gradient_accumulation_steps=8,
+        weight_decay=0.001,
+        warmup_ratio=0.05,
+        lr_scheduler_type="cosine",
+        optim="adamw_8bit",
         per_device_train_batch_size=1,
-        warmup_steps=20,
-        num_generations=2,
+        gradient_accumulation_steps=8,
+        num_generations=4,
         max_completion_length=1024,
-        use_vllm=True,
-        vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.25,  # reduced from 0.3 to leave more headroom for backward pass
-        vllm_max_model_length=4096,
+        num_train_epochs=1,
+        gradient_checkpointing=True,
         output_dir=args.output_dir,
         report_to=args.report_to,
         trackio_space_id=args.output_dir if args.report_to == "trackio" else None,
         logging_steps=1,
         save_steps=10,
-        save_total_limit=1,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        push_to_hub=args.push_to_hub,
+        push_to_hub=False,             # push handled manually via Unsloth API below
+        seed=args.seed,
     )
-    log.info("Output: %s | vLLM mode: colocate", args.output_dir)
+    log.info("Output: %s", args.output_dir)
 
-    # ── Create trainer ──────────────────────────────────────────────────────
+    # ── GRPOTrainer ─────────────────────────────────────────────────────────
     trainer = GRPOTrainer(
-        model=args.model_id,
+        model=model,
         processing_class=tokenizer,
         reward_funcs=[
             reward_evacuated,
@@ -657,12 +643,11 @@ if __name__ == "__main__":
         rollout_func=rollout_func,
     )
 
-    # GPU snapshot
     if torch.cuda.is_available():
         gpu       = torch.cuda.get_device_properties(0)
         start_mem = round(torch.cuda.max_memory_reserved() / 1024**3, 3)
-        total     = round(gpu.total_memory / 1024**3, 3)
-        log.info("GPU: %s — %s GB total, %s GB reserved", gpu.name, total, start_mem)
+        total_mem = round(gpu.total_memory / 1024**3, 3)
+        log.info("GPU: %s — %s GB total, %s GB reserved", gpu.name, total_mem, start_mem)
 
     # ── Train ────────────────────────────────────────────────────────────────
     trainer_stats = trainer.train()
@@ -674,10 +659,27 @@ if __name__ == "__main__":
             trainer_stats.metrics["train_runtime"] / 60, used,
         )
 
-    # ── Save and (optionally) push ──────────────────────────────────────────
-    trainer.save_model(args.output_dir)
+    # ── Save ─────────────────────────────────────────────────────────────────
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Always save LoRA adapters
+    model.save_lora(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    log.info("LoRA adapters saved to %s", args.output_dir)
+
+    # Optionally merge weights into a full 16-bit checkpoint
+    if args.save_merged:
+        merged_dir = args.output_dir + "_merged"
+        model.save_pretrained_merged(merged_dir, tokenizer, save_method="merged_16bit")
+        log.info("Merged 16-bit checkpoint saved to %s", merged_dir)
+
+    # Optionally push to the Hugging Face Hub
     if args.push_to_hub:
-        trainer.push_to_hub()
-        log.info("Model saved to %s and pushed to Hub.", args.output_dir)
-    else:
-        log.info("Model saved to %s.", args.output_dir)
+        repo = args.hub_repo or args.output_dir
+        model.push_to_hub_merged(
+            repo,
+            tokenizer,
+            save_method="merged_16bit",
+            token=os.getenv("HF_TOKEN"),
+        )
+        log.info("Model pushed to Hub: %s", repo)
