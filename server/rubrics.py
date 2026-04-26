@@ -134,7 +134,7 @@ class ProgressReward:
             exits = exit_positions  # all blocked — still try to reward progress
         prev_dist = _bfs_exit_dist(prev_agent_x, prev_agent_y, exits, cell_grid, w, h)
         new_dist = _bfs_exit_dist(agent_x, agent_y, exits, cell_grid, w, h)
-        return 0.1 if new_dist < prev_dist else 0.0
+        return 0.15 if new_dist < prev_dist else 0.0
 
 
 class DangerPenalty:
@@ -320,21 +320,40 @@ class SelfDeathPenalty:
 class TimeoutPenalty:
     """Penalty for running out of steps while still alive without evacuating.
 
-    Lighter than SelfDeathPenalty (–5 vs –10) to maintain the ordering:
-    success > timeout > death. Creates pressure to act decisively.
+    Maintains the ordering: success > timeout > death.
+
+    If exits were reachable (not all blocked by fire), the penalty scales with
+    remaining health — a healthy agent that timed out demonstrably could have
+    evacuated, so it receives a stronger signal (-5 to -8).
+
+    If all exits were fire-blocked, the agent had no path out regardless of
+    health, so a flat -5 is applied (not the agent's fault).
     """
 
-    def score(self, done: bool, agent_alive: bool, agent_evacuated: bool, **_) -> float:
-        return -5.0 if (done and agent_alive and not agent_evacuated) else 0.0
+    def score(
+        self,
+        done: bool,
+        agent_alive: bool,
+        agent_evacuated: bool,
+        agent_health: float,
+        reachable_exit_count: int,
+        **_,
+    ) -> float:
+        if not (done and agent_alive and not agent_evacuated):
+            return 0.0
+        if reachable_exit_count == 0:
+            return -5.0  # exits were fire-blocked — flat penalty, not the agent's fault
+        # Agent had open exits but still timed out — scale by how healthy it was.
+        # hp=100 → -8.0,  hp=50 → -6.5,  hp=10 → -5.3
+        return -5.0 - 3.0 * (agent_health / 100.0)
 
 
 class NearMissBonus:
-    """Graduated partial credit on failure based on closest exit approach.
+    """Graduated partial credit on DEATH based on closest exit approach.
 
-    Fixes hard-mode reward collapse: when all episodes end in failure the
-    flat SelfDeathPenalty creates zero gradient. This rubric differentiates
-    "almost made it" from "never got close" using the minimum BFS distance
-    the agent reached during the episode.
+    Fixes hard-mode reward collapse: when all episodes end in death the flat
+    SelfDeathPenalty creates zero gradient. This rubric differentiates "almost
+    made it" from "never got close" using the minimum BFS distance reached.
 
     Formula: max(0.0, 3.0 – 0.5 × min_exit_dist_reached)
       dist=0 → +3.0  (at exit but died — edge case)
@@ -342,17 +361,21 @@ class NearMissBonus:
       dist=3 → +1.5
       dist=6 → 0.0   (no credit beyond 6 cells away)
 
-    Only fires on failure (death OR timeout), not on success.
+    Only fires on DEATH — not on timeout. A timed-out agent was alive and
+    had the opportunity to act; softening the TimeoutPenalty here would
+    undermine the health-scaled signal from TimeoutPenalty.
     """
 
     def score(
         self,
         done: bool,
+        agent_alive: bool,
         agent_evacuated: bool,
         min_exit_dist_reached: int,
         **_,
     ) -> float:
-        if not done or agent_evacuated:
+        # Only award on death (not alive, not evacuated)
+        if not done or agent_evacuated or agent_alive:
             return 0.0
         return max(0.0, 3.0 - 0.5 * min_exit_dist_reached)
 

@@ -11,11 +11,11 @@ Configuration via environment variables:
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from pydantic import Field
+from pydantic import Field, BaseModel
 from fastapi import HTTPException
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from openenv.core.env_server.http_server import create_app
-from pydantic import BaseModel
 from starlette.routing import Route
 
 try:
@@ -85,11 +85,20 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 @app.get("/")
 def serve_frontend() -> FileResponse:
-    """Serve the bundled RPG viewer from server/static/viewer_rpg.html."""
-    html_path = STATIC_DIR / "viewer_rpg.html"
+    """Serve the React frontend from server/static/index.html."""
+    html_path = STATIC_DIR / "index.html"
     if not html_path.exists():
-        raise HTTPException(status_code=404, detail="Frontend file not found: server/static/viewer_rpg.html")
+        # Fallback to the RPG viewer if index.html is missing
+        rpg_path = STATIC_DIR / "viewer_rpg.html"
+        if rpg_path.exists():
+            return FileResponse(str(rpg_path))
+        raise HTTPException(status_code=404, detail="Frontend file not found.")
     return FileResponse(str(html_path))
+
+
+# Mount the static directory for assets (CSS, JS, etc.)
+if (STATIC_DIR / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets")), name="assets")
 
 
 @app.post("/reset")
@@ -225,7 +234,6 @@ def get_scene() -> Dict[str, Any]:
     }
 
     # --- 2-D multi-channel grid ---
-    # grid[y][x] = [cell_type, fire, smoke, is_agent, is_visible]
     w, h = st.grid_w, st.grid_h
     grid: List[List[List[float]]] = []
     for y in range(h):

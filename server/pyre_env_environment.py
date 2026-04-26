@@ -572,6 +572,7 @@ class PyreEnvironment(Environment):
             is_new_cell=is_new_cell,
             min_exit_dist_reached=self._min_exit_dist_reached,
             rewarded_doors=self._rewarded_doors,
+            reachable_exit_count=len(unblocked_exits(st.exit_positions, st.fire_grid, st.grid_w)),
         )
 
         total = 0.0

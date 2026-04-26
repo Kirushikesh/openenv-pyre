@@ -47,6 +47,7 @@ class FloorPlan:
     spawn_zones: List[Tuple[int, int]]      # valid NPC spawn cells
     agent_spawn_options: List[Tuple[int, int]]
     zone_map: Dict[str, str]                # "{x},{y}" → zone_label
+    static_objects: Dict[str, str] = field(default_factory=dict) # "{x},{y}" → item_type
     fire_min_exit_dist: int = 5             # fire ignition at least this far from any exit
     fuel_map: List[float] = field(default_factory=list)         # fire fuel per cell
     ventilation_map: List[float] = field(default_factory=list)  # smoke decay per cell

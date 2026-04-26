@@ -1,0 +1,12 @@
+artifacts/
+frontend/
+node_modules/
+__pycache__/
+*.py[cod]
+.venv/
+.git/
+.env
+.cursor/
+*.egg-info/
+dist/
+build/

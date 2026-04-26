@@ -170,3 +170,6 @@ run_training_no_vllm.sh
 hf_evals/
 outputs/
 run_training_openenv.sh
+artifacts/
+frontend_new_desgin/
+node_modules/

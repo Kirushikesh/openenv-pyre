@@ -1,0 +1,11 @@
+artifacts/
+frontend/
+node_modules/
+.venv/
+.git/
+__pycache__/
+*.py[cod]
+.env
+.dockerignore
+.gitignore
+.cursor/
