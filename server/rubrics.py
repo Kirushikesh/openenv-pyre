@@ -1,5 +1,5 @@
 """
-Composite reward rubrics for Pyre (single-agent).
+Composite reward rubrics for Pyre.
 
 Each rubric class exposes a score() method.
 The environment composes them by calling each rubric each step.
@@ -13,6 +13,7 @@ Per-step rubrics:
   HealthDrainPenalty         -0.02×dmg  proportional to health lost this step
   StrategicDoorBonus         +0.5       closed a door adjacent to active fire (once per door per episode)
   ExplorationBonus           +0.02      first visit to a cell in this episode
+  StampedePenalty            -1.5×N     per crush event triggered this step
 
 Episode-end rubrics:
   SelfSurviveBonus         +5.0              agent reached an open exit alive
@@ -21,6 +22,15 @@ Episode-end rubrics:
   TimeoutPenalty           -5.0              agent ran out of steps while still alive (lighter than death)
   NearMissBonus            0→+3.0            partial credit on failure based on closest approach to exit
   TimeBonus                +0.05×rem         reward for finishing quickly (remaining steps)
+  EvacCountBonus           +1.0×N            per NPC successfully evacuated
+  CasualtyPenalty          -2.0×N            per NPC incapacitated (casualties weighted 2× evacuations)
+  NoStampedeBonus          +3.0              episode ended with zero crush events
+
+Weight rationale:
+  Casualties 2× evacuations — losing someone is worse than saving someone is good;
+  prevents agent from writing off slow/injured movers.
+  No-stampede bonus — the "clean run" signal training curves will show improving.
+  Stampede per-step — teaches avoidance, not just final outcome.
 """
 
 from collections import deque
@@ -287,6 +297,20 @@ class ExplorationBonus:
         return 0.02 if (action == "move" and is_new_cell) else 0.0
 
 
+class StampedePenalty:
+    """Per-step penalty for each crush event triggered this step.
+
+    Applied each step immediately when crushes occur (not just at episode end)
+    so the gradient signal is dense. Teaches the agent to recognize and avoid
+    situations that cause crowd crushes.
+
+    -1.5 per crush event.
+    """
+
+    def score(self, new_stampede_events: int = 0, **_) -> float:
+        return -1.5 * new_stampede_events
+
+
 # ---------------------------------------------------------------------------
 # Episode-end rubrics
 # ---------------------------------------------------------------------------
@@ -364,6 +388,41 @@ class TimeBonus:
         return 0.05 * remaining_steps if (done and agent_evacuated) else 0.0
 
 
+class EvacCountBonus:
+    """Bonus for each NPC successfully evacuated by end of episode.
+
+    +1.0 per evacuated NPC. Rewards the agent for indirectly facilitating crowd
+    flow (opening doors, keeping fire away from exit paths).
+    """
+
+    def score(self, done: bool, people_evacuated: int = 0, **_) -> float:
+        return 1.0 * people_evacuated if done else 0.0
+
+
+class CasualtyPenalty:
+    """Penalty for each NPC incapacitated by end of episode.
+
+    -2.0 per casualty. Weighted 2× the evacuation bonus so the agent cannot
+    break-even by trading one casualty for one evacuation — every life lost
+    hurts more than every life saved helps.
+    """
+
+    def score(self, done: bool, people_casualties: int = 0, **_) -> float:
+        return -2.0 * people_casualties if done else 0.0
+
+
+class NoStampedeBonus:
+    """Bonus for completing an episode with zero stampede/crush events.
+
+    +3.0 at episode end if stampede_events == 0. This is the "clean run"
+    reward — the signal training curves should show increasing over time as
+    the agent learns to manage crowd flow through door manipulation.
+    """
+
+    def score(self, done: bool, stampede_events: int = 0, **_) -> float:
+        return 3.0 if (done and stampede_events == 0) else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Convenience factories
 # ---------------------------------------------------------------------------
@@ -378,6 +437,7 @@ def make_per_step_rubrics():
         HealthDrainPenalty(),
         StrategicDoorBonus(),
         ExplorationBonus(),
+        StampedePenalty(),
     ]
 
 
@@ -389,4 +449,7 @@ def make_episode_end_rubrics():
         TimeoutPenalty(),
         NearMissBonus(),
         TimeBonus(),
+        EvacCountBonus(),
+        CasualtyPenalty(),
+        NoStampedeBonus(),
     ]

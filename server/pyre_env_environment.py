@@ -30,6 +30,7 @@ Done conditions:
 import os
 import random
 import uuid
+from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from openenv.core.env_server.interfaces import Environment
@@ -41,6 +42,7 @@ except (ImportError, ModuleNotFoundError):
 from .fire_sim import FireSim, FIRE_BURNING, smoke_level_label, WIND_DIRS
 from .floor_plan import generate_episode, generate_procedural_floor_plan, template_names
 from .narrative import build_look_result, build_narrative_observation, compute_visible_cells
+from .npc_model import NPC, spawn_npcs, step_npc, detect_and_apply_crushes, npc_summary
 from .rubrics import make_per_step_rubrics, make_episode_end_rubrics, bfs_exit_dist, unblocked_exits, BFS_INF
 
 # Cell type constants
@@ -127,15 +129,20 @@ class PyreEnvironment(Environment):
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
+    # Default NPC count per difficulty level
+    _NPC_COUNT = {"easy": 5, "medium": 8, "hard": 10}
+
     def __init__(
         self,
         max_steps: int = 150,
         base_seed: int = 42,
+        npc_count: Optional[int] = None,
     ):
         super().__init__()
 
         self.max_steps = int(os.environ.get("PYRE_MAX_STEPS", max_steps))
         self.base_seed = int(os.environ.get("PYRE_SEED", base_seed))
+        self._npc_count_override = npc_count  # None → use difficulty default
 
         self._state: Optional[PyreState] = None
         self._fire_sim: Optional[FireSim] = None
@@ -149,6 +156,10 @@ class PyreEnvironment(Environment):
         self._visited_cells: set = set()
         self._min_exit_dist_reached: int = BFS_INF
         self._rewarded_doors: set = set()
+
+        # NPC state (reset each episode)
+        self._npcs: List[NPC] = []
+        self._prev_stampede_events: int = 0  # for per-step delta
 
     # ------------------------------------------------------------------
     # OpenEnv API
@@ -267,12 +278,32 @@ class PyreEnvironment(Environment):
             fire_spread_rate=p_spread,
             wind_dir=wind_dir,
             humidity=humidity,
+            # NPC tracking
+            people_count=0,
+            people_evacuated=0,
+            people_casualties=0,
+            stampede_events=0,
         )
 
         # Reset episode-scoped reward tracking
         self._visited_cells = {(self._state.agent_x, self._state.agent_y)}
         self._min_exit_dist_reached = BFS_INF
         self._rewarded_doors = set()
+        self._prev_stampede_events = 0
+
+        # Spawn NPCs
+        npc_count = (
+            self._npc_count_override
+            if self._npc_count_override is not None
+            else self._NPC_COUNT.get(difficulty.lower(), 8)
+        )
+        self._npcs = spawn_npcs(
+            count=npc_count,
+            spawn_zones=list(floor_plan.spawn_zones),
+            agent_start=tuple(agent_start),
+            rng=self._rng,
+        )
+        self._state.people_count = len(self._npcs)
 
         self._fire_sim = FireSim(
             w=w, h=h, rng=self._rng,
@@ -299,6 +330,7 @@ class PyreEnvironment(Environment):
             last_action_feedback=self._last_feedback,
             wind_dir=wind_dir,
             w=w, h=h,
+            npcs=self._npcs,
         )
         obs_data["map_state"] = self._build_map_state(self._state)
         return PyreObservation(**obs_data)
@@ -332,6 +364,43 @@ class PyreEnvironment(Environment):
 
         # --- Advance fire simulation ---
         self._fire_sim.step(st.cell_grid, st.fire_grid, st.smoke_grid, st.burn_timers)
+
+        # --- Step all NPCs (autonomous movement) ---
+        exit_tuples = [(ex[0], ex[1]) for ex in st.exit_positions]
+        pre_evacuated = {n.npc_id for n in self._npcs if n.evacuated}
+        for npc in self._npcs:
+            step_npc(
+                npc,
+                cell_grid=st.cell_grid,
+                fire_grid=st.fire_grid,
+                smoke_grid=st.smoke_grid,
+                exit_positions=exit_tuples,
+                w=st.grid_w,
+                h=st.grid_h,
+                rng=self._rng,
+            )
+
+        # --- Crush detection after all NPCs have moved ---
+        # 1. Density + funnel crush (panicked NPCs clustering near exits)
+        new_crushes = detect_and_apply_crushes(
+            self._npcs, exit_tuples, self._rng
+        )
+
+        # 2. Exit flow crush: 2+ NPCs evacuating through the same exit in one step
+        newly_evacuated = [n for n in self._npcs if n.evacuated and n.npc_id not in pre_evacuated]
+        exit_flow = Counter((n.x, n.y) for n in newly_evacuated)
+        new_crushes += sum(1 for count in exit_flow.values() if count >= 2)
+
+        st.stampede_events += new_crushes
+
+        # Inject crush event into narrative feedback so agent sees it immediately
+        if new_crushes > 0:
+            crush_msg = "You hear screaming and the sound of people colliding near an exit — a crush event just occurred!"
+            self._last_feedback = (self._last_feedback + " " + crush_msg).strip()
+
+        # Sync NPC counts into state
+        st.people_evacuated = sum(1 for n in self._npcs if n.evacuated)
+        st.people_casualties = sum(1 for n in self._npcs if n.state == "incapacitated" and not n.evacuated)
 
         # --- Apply health damage from smoke/fire ---
         health_damage = 0.0
@@ -383,6 +452,7 @@ class PyreEnvironment(Environment):
             prev_agent_y=prev_agent_y,
             health_damage=health_damage,
             is_new_cell=is_new_cell,
+            new_stampede_events=new_crushes,
             st=st,
             done=done,
         )
@@ -404,6 +474,7 @@ class PyreEnvironment(Environment):
             last_action_feedback=self._last_feedback,
             wind_dir=st.wind_dir,
             w=st.grid_w, h=st.grid_h,
+            npcs=self._npcs,
         )
         obs_data["done"] = done
         obs_data["reward"] = reward
@@ -415,6 +486,10 @@ class PyreEnvironment(Environment):
             "fire_sources": st.fire_sources_count,
             "humidity": st.humidity,
             "difficulty": getattr(self, "_difficulty", "medium"),
+            "npc_summary": npc_summary(self._npcs),
+            "stampede_events": st.stampede_events,
+            "people_evacuated": st.people_evacuated,
+            "people_casualties": st.people_casualties,
         }
         obs_data["map_state"] = self._build_map_state(st)
         return PyreObservation(**obs_data)
@@ -545,6 +620,7 @@ class PyreEnvironment(Environment):
         prev_agent_y: int,
         health_damage: float,
         is_new_cell: bool,
+        new_stampede_events: int,
         st: PyreState,
         done: bool,
     ) -> float:
@@ -572,6 +648,11 @@ class PyreEnvironment(Environment):
             is_new_cell=is_new_cell,
             min_exit_dist_reached=self._min_exit_dist_reached,
             rewarded_doors=self._rewarded_doors,
+            # NPC reward inputs
+            new_stampede_events=new_stampede_events,
+            stampede_events=st.stampede_events,
+            people_evacuated=st.people_evacuated,
+            people_casualties=st.people_casualties,
         )
 
         total = 0.0

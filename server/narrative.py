@@ -119,6 +119,7 @@ def build_narrative_observation(
     wind_dir: str,
     w: int,
     h: int,
+    npcs: Optional[List[Any]] = None,  # List[NPC] — typed as Any to avoid circular import
 ) -> Dict[str, Any]:
     """Build the full observation dict (matches PyreObservation fields)."""
     if agent_evacuated:
@@ -211,6 +212,24 @@ def build_narrative_observation(
     # --- Zone label ---
     location_label = zone_map.get(f"{agent_x},{agent_y}", "unknown area")
 
+    # --- Visible NPCs ---
+    visible_people: List[Dict[str, Any]] = []
+    if npcs:
+        for npc in npcs:
+            if npc.evacuated:
+                continue
+            if (npc.x, npc.y) in visible:
+                dist = _manhattan(agent_x, agent_y, npc.x, npc.y)
+                rel = _relative_pos_str(agent_x, agent_y, npc.x, npc.y)
+                visible_people.append({
+                    "id": npc.npc_id,
+                    "relative_pos": rel,
+                    "state": npc.state,
+                    "distance": dist,
+                })
+        # Sort nearest first
+        visible_people.sort(key=lambda p: p["distance"])
+
     # --- Action hints ---
     action_hints = _build_action_hints(
         agent_x, agent_y, cell_grid, visible,
@@ -227,6 +246,7 @@ def build_narrative_observation(
         health_label=health_label,
         wind_dir=wind_dir,
         visible_objects=visible_objects,
+        visible_people=visible_people,
         blocked_exit_ids=blocked_exit_ids,
         audible=audible,
         last_action_feedback=last_action_feedback,
@@ -244,6 +264,7 @@ def build_narrative_observation(
         "health_status": health_label,
         "wind_dir": wind_dir,
         "visible_objects": visible_objects,
+        "visible_people": visible_people,
         "blocked_exit_ids": blocked_exit_ids,
         "audible_signals": audible,
         "elapsed_steps": step_count,
@@ -312,6 +333,7 @@ def _compose_narrative(
     health_label: str,
     wind_dir: str,
     visible_objects: List[Dict],
+    visible_people: List[Dict],
     blocked_exit_ids: List[str],
     audible: List[str],
     last_action_feedback: str,
@@ -350,6 +372,27 @@ def _compose_narrative(
 
     if blocked_exit_ids:
         lines.append(f"WARNING: {len(blocked_exit_ids)} exit(s) blocked by fire — find an alternative route.")
+
+    # People
+    if visible_people:
+        n = len(visible_people)
+        if n == 1:
+            p = visible_people[0]
+            lines.append(f"You see 1 person nearby: {p['id']} ({p['state']}) at {p['relative_pos']}.")
+        else:
+            descs = [f"{p['id']} ({p['state']}) at {p['relative_pos']}" for p in visible_people[:5]]
+            suffix = f" and {n - 5} more" if n > 5 else ""
+            lines.append(f"You see {n} people nearby: {', '.join(descs)}{suffix}.")
+
+        # Crowd-state summary warning
+        panicked = [p for p in visible_people if p["state"] == "panicked"]
+        injured = [p for p in visible_people if p["state"] == "injured"]
+        if len(panicked) >= 3:
+            lines.append(f"WARNING: {len(panicked)} people are PANICKING — crush risk is high.")
+        elif panicked:
+            lines.append(f"{len(panicked)} person(s) are panicking.")
+        if injured:
+            lines.append(f"{len(injured)} person(s) are injured and cannot move.")
 
     # Sound
     if audible:
@@ -480,6 +523,7 @@ def _terminal_obs(
         "health_status": _health_label(agent_health),
         "wind_dir": "CALM",
         "visible_objects": [],
+        "visible_people": [],
         "blocked_exit_ids": [],
         "audible_signals": [],
         "elapsed_steps": step_count,

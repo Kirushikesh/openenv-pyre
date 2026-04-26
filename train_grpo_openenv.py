@@ -83,6 +83,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("grpo_openenv")
 
+# ── rollout trace file ────────────────────────────────────────────────────────
+_rollout_file: Optional[Any] = None
+_batch_counter: int = 0
+
+
+def _init_rollout_file(output_dir: str) -> None:
+    """Open {output_dir}/rollout_traces.log for appending plain text."""
+    global _rollout_file
+    log_path = Path(output_dir) / "rollout_traces.log"
+    _rollout_file = open(log_path, "a", encoding="utf-8")  # noqa: SIM115
+    log.info("Rollout trace file → %s", log_path)
+
+
+def _rlog(msg: str = "") -> None:
+    """Write one line to the rollout trace file (no-op before init)."""
+    if _rollout_file is not None:
+        _rollout_file.write(msg + "\n")
+        _rollout_file.flush()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Difficulty registry + stratified mix (notebook "cell-1" analogue)
@@ -299,6 +318,7 @@ def rollout_once(
     max_turns: int,
     difficulty: str,
     seed: int,
+    episode_num: int = 0,
 ) -> Dict[str, Any]:
     """Execute one full Pyre episode using generate_rollout_completions.
 
@@ -317,6 +337,10 @@ def rollout_once(
     think_steps:     int        = 0
 
     MAX_TOK_ACCUM = 8192
+
+    _rlog("=" * 72)
+    _rlog(f"  BATCH {_batch_counter}  |  EPISODE {episode_num}  |  difficulty={difficulty}  |  seed={seed}")
+    _rlog("=" * 72)
 
     try:
         env  = PyreEnvironment()
@@ -348,10 +372,9 @@ def rollout_once(
                     tokenize=False,
                 )
 
-            log.debug(
-                "\n[difficulty=%s seed=%d step=%d] ── PROMPT ──────────────────────────\n%s\n────────────────────────────────────",
-                difficulty, seed, _turn + 1, prompt_text,
-            )
+            _rlog(f"\n── STEP {_turn + 1} " + "─" * (64 - len(str(_turn + 1))))
+            _rlog("[PROMPT]")
+            _rlog(prompt_text)
 
             rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
             prompt_ids.extend(rollout_outputs["prompt_ids"])
@@ -361,10 +384,8 @@ def rollout_once(
                 rollout_outputs["completion_ids"], skip_special_tokens=False
             )
 
-            log.debug(
-                "\n[difficulty=%s seed=%d step=%d] ── COMPLETION ──────────────────────\n%s\n────────────────────────────────────",
-                difficulty, seed, _turn + 1, completion_text,
-            )
+            _rlog("\n[COMPLETION]")
+            _rlog(completion_text)
 
             if "<think>" in completion_text and "</think>" in completion_text:
                 think_steps += 1
@@ -380,7 +401,11 @@ def rollout_once(
             step_rewards.append(step_reward + fmt_penalty)
 
             feedback = obs.last_action_feedback or ""
-            # Reward is intentionally excluded from the history entry.
+            _rlog(f"\n[ACTION]   {json.dumps(action_dict)}  |  fmt_score={fmt_score:.2f}  |  fmt_penalty={fmt_penalty:+.3f}")
+            _rlog(f"[REWARD]   step_reward={step_reward:+.4f}  |  total={step_reward + fmt_penalty:+.4f}  |  health={obs.agent_health:.1f}  |  done={done}")
+            if feedback:
+                _rlog(f"[FEEDBACK] {feedback}")
+
             history.append(
                 f"Step {_turn + 1}: {json.dumps(action_dict)}"
                 + (f"\n  → {feedback}" if feedback else "")
@@ -392,6 +417,8 @@ def rollout_once(
 
     except Exception as exc:
         log.error("Episode failed (difficulty=%s seed=%d): %s", difficulty, seed, exc)
+        _rlog(f"\n[ERROR] Episode crashed: {exc}")
+        _rlog("=" * 72)
         return {
             "prompt_ids":       [],
             "completion_ids":   [],
@@ -408,6 +435,15 @@ def rollout_once(
     format_rate      = think_steps / max(steps_taken, 1)
     meta             = DIFFICULTY_REGISTRY[difficulty]
 
+    outcome = "EVACUATED" if agent_evacuated else "failed"
+    _rlog(f"\n── RESULT " + "─" * 62)
+    _rlog(
+        f"[{outcome}]  health={final_health:.1f}  |  steps={steps_taken}"
+        f"  |  mean_step={mean_step_reward:+.4f}  |  fmt={format_rate * 100:.0f}%"
+        f"  |  think_steps={think_steps}"
+    )
+    _rlog("=" * 72)
+
     return {
         "prompt_ids":       prompt_ids,
         "completion_ids":   completion_ids,
@@ -423,6 +459,9 @@ def rollout_once(
 
 def rollout_func(prompts, trainer=None):
     """Called by GRPOTrainer once per training batch."""
+    global _batch_counter
+    _batch_counter += 1
+
     episode_prompt_ids:     List[List[int]]   = []
     episode_completion_ids: List[List[int]]   = []
     episode_logprobs:       List[List[float]] = []
@@ -451,6 +490,7 @@ def rollout_func(prompts, trainer=None):
             max_turns=meta.max_steps,
             difficulty=difficulty,
             seed=seed,
+            episode_num=i + 1,
         )
 
         episode_prompt_ids.append(episode["prompt_ids"])
@@ -544,8 +584,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-size", type=int, default=1000)
     p.add_argument("--output-dir",   default="./outputs/grpo_pyre_easy")
     p.add_argument("--push-to-hub",  action="store_true")
-    p.add_argument("--debug",        action="store_true",
-                   help="Log full prompt and completion text for each step")
     p.add_argument("--report-to",    default="trackio",
                    choices=["trackio", "tensorboard", "none"])
     p.add_argument("--seed",         type=int, default=42)
@@ -556,9 +594,8 @@ if __name__ == "__main__":
     args = parse_args()
     random.seed(args.seed)
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        log.debug("Debug logging enabled — full prompt/completion will be printed each step.")
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    _init_rollout_file(args.output_dir)
 
     # ── Init tokenizer ──────────────────────────────────────────────────────
     tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
@@ -595,12 +632,13 @@ if __name__ == "__main__":
         use_vllm=True,
         vllm_mode="colocate",
         vllm_gpu_memory_utilization=0.3,
-        vllm_max_model_length=8192,
+        vllm_max_model_length=4096,
         output_dir=args.output_dir,
         report_to=args.report_to,
         trackio_space_id=args.output_dir if args.report_to == "trackio" else None,
         logging_steps=1,
         save_steps=10,
+        save_total_limit=1,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         push_to_hub=args.push_to_hub,

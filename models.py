@@ -130,6 +130,10 @@ class PyreObservation(Observation):
         default_factory=list,
         description="Objects in sight: [{id, type, relative_pos, state}]",
     )
+    visible_people: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="NPCs in sight: [{id, relative_pos, state, distance}]",
+    )
     blocked_exit_ids: List[str] = Field(
         default_factory=list,
         description="Exit IDs currently blocked by fire",
@@ -184,6 +188,12 @@ class PyreState(State):
     agent_alive: bool = True
     agent_evacuated: bool = False
     agent_health: float = 100.0
+
+    # --- NPC tracking (updated each step) ---
+    people_count: int = 0           # total NPCs spawned this episode
+    people_evacuated: int = 0       # NPCs that reached a safe exit
+    people_casualties: int = 0      # NPCs that became incapacitated
+    stampede_events: int = 0        # total crush events triggered this episode
 
     # --- Episode fire config (randomized each episode) ---
     max_steps: int = 150
