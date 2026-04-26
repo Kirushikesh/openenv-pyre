@@ -50,6 +50,11 @@ class FloorPlan:
     fire_min_exit_dist: int = 5             # fire ignition at least this far from any exit
     fuel_map: List[float] = field(default_factory=list)         # fire fuel per cell
     ventilation_map: List[float] = field(default_factory=list)  # smoke decay per cell
+    # Visual-only decorations: "x,y" → item type ("desk"|"chair"|"filing"|"plant"|"table")
+    # Positions are fixed per template and guaranteed to be on floor cells,
+    # not adjacent to any door, and spaced so walkable clearance is preserved.
+    furniture_map: Dict[str, str] = field(default_factory=dict)
+    furniture_map: Dict[str, str] = field(default_factory=dict) # "{x},{y}" → item type (visual only)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +211,22 @@ def _make_small_office() -> FloorPlan:
 
     fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
 
+    # Furniture: one desk per north room (y=1, clear of door at y=4).
+    # South rooms use y=13 (two rows below door at y=10, leaves y=11-12 as walkable).
+    # No furniture on corridor rows or adjacent to any door cell.
+    furniture_map: Dict[str, str] = {
+        # North offices — desk at back wall (y=1), chair one step in (y=2)
+        "2,1": "desk",   "1,2": "chair",   # room 1
+        "6,1": "desk",   "5,2": "chair",   # room 2
+        "10,1": "desk",                    # room 3
+        "13,1": "filing",                  # room 4 (narrow — just a cabinet)
+        # South offices — desk at y=13 (two below door at y=10)
+        "2,13": "desk",  "1,12": "chair",  # room 1
+        "6,13": "desk",                    # room 2
+        "10,13": "plant",                  # room 3
+        "13,13": "filing",                 # room 4
+    }
+
     return FloorPlan(
         name="small_office",
         cell_grid=grid,
@@ -218,6 +239,7 @@ def _make_small_office() -> FloorPlan:
         fire_min_exit_dist=5,
         fuel_map=fuel_map,
         ventilation_map=ventilation_map,
+        furniture_map=furniture_map,
     )
 
 
@@ -284,6 +306,14 @@ def _make_open_plan() -> FloorPlan:
 
     fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
 
+    # Open-plan furniture: a small desk cluster in the northwest quadrant and a
+    # plant in the southeast. Kept away from pillar obstacles (3-4,3-4) and both
+    # exits (0,1) and (15,15). No doors exist so only walkable clearance matters.
+    furniture_map: Dict[str, str] = {
+        "6,5": "desk",   "5,6": "chair",  # northwest cluster
+        "12,9": "plant",                  # southeast accent
+    }
+
     return FloorPlan(
         name="open_plan",
         cell_grid=grid,
@@ -296,6 +326,7 @@ def _make_open_plan() -> FloorPlan:
         fire_min_exit_dist=4,
         fuel_map=fuel_map,
         ventilation_map=ventilation_map,
+        furniture_map=furniture_map,
     )
 
 
@@ -370,6 +401,17 @@ def _make_t_corridor() -> FloorPlan:
 
     fuel_map, ventilation_map = _build_fuel_and_ventilation(grid, zone_map, W, H)
 
+    # Upper alcoves (y=8-9) open directly onto the bar corridor — one item each.
+    # Lower rooms: doors are at y=10, so y=11 is door-adjacent; use y=12 only.
+    furniture_map: Dict[str, str] = {
+        "1,8":  "desk",    # left alcove A
+        "4,8":  "chair",   # left alcove B
+        "9,8":  "filing",  # right alcove A
+        "12,8": "plant",   # right alcove B
+        "1,12": "desk",    # lower-left room (clear of door at y=10)
+        "9,12": "chair",   # lower-right room
+    }
+
     return FloorPlan(
         name="t_corridor",
         cell_grid=grid,
@@ -382,6 +424,7 @@ def _make_t_corridor() -> FloorPlan:
         fire_min_exit_dist=4,
         fuel_map=fuel_map,
         ventilation_map=ventilation_map,
+        furniture_map=furniture_map,
     )
 
 
@@ -445,6 +488,7 @@ def generate_episode(
         fire_min_exit_dist=fp.fire_min_exit_dist,
         fuel_map=fp.fuel_map[:],
         ventilation_map=fp.ventilation_map[:],
+        furniture_map=fp.furniture_map.copy(),
     )
 
     # Agent start
@@ -774,6 +818,17 @@ def _try_generate_procedural(
     if not _proc_bfs_reachable(test_spawn[0], test_spawn[1], exit_positions_list, grid, w, h):
         return None
 
+    # One decorative item at the interior centre of each room.
+    # Centre is always ≥1 cell from room walls and ≥2 cells from corridor doors
+    # (doors sit in corridor cells outside the room boundary), so walkable
+    # clearance is guaranteed for every minimum-size (3×3) room.
+    _PROC_ITEMS = ["desk", "chair", "filing", "plant"]
+    furniture_map: Dict[str, str] = {}
+    for i, (rx1, ry1, rx2, ry2) in enumerate(rooms):
+        cx, cy = (rx1 + rx2) // 2, (ry1 + ry2) // 2
+        if grid[cy * w + cx] == FLOOR:
+            furniture_map[f"{cx},{cy}"] = _PROC_ITEMS[i % len(_PROC_ITEMS)]
+
     return FloorPlan(
         name=f"procedural_{w}x{h}",
         cell_grid=grid,
@@ -786,6 +841,7 @@ def _try_generate_procedural(
         fire_min_exit_dist=5,
         fuel_map=fuel_map,
         ventilation_map=ventilation_map,
+        furniture_map=furniture_map,
     )
 
 

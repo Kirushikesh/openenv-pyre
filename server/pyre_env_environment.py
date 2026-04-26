@@ -267,6 +267,7 @@ class PyreEnvironment(Environment):
             exit_positions=[[ex[0], ex[1]] for ex in floor_plan.exit_positions],
             door_registry=door_registry,
             zone_map=floor_plan.zone_map,
+            furniture_map=floor_plan.furniture_map,
             agent_x=agent_start[0],
             agent_y=agent_start[1],
             agent_alive=True,
@@ -701,6 +702,7 @@ class PyreEnvironment(Environment):
             fire_spread_rate=st.fire_spread_rate,
             wind_dir=st.wind_dir,
             humidity=st.humidity,
+            furniture_map=dict(getattr(st, "furniture_map", {})),
         )
 
     # ------------------------------------------------------------------

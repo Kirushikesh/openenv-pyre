@@ -80,6 +80,13 @@ class PyreMapState(BaseModel):
     wind_dir: str = Field(..., description="Wind direction affecting fire spread")
     humidity: float = Field(..., description="Humidity level (higher = slower spread)")
 
+    # Visual decorations: "x,y" → item type ("desk"|"chair"|"filing"|"plant"|"table")
+    # Fixed per template, purely cosmetic — no gameplay or physics effect.
+    furniture_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Cosmetic furniture: 'x,y' → item type for UI rendering",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Action
@@ -202,3 +209,6 @@ class PyreState(State):
     fire_spread_rate: float = 0.25
     wind_dir: str = "CALM"
     humidity: float = 0.25
+
+    # Visual-only furniture layer (fixed per floor plan template)
+    furniture_map: Dict[str, str] = Field(default_factory=dict)
