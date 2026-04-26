@@ -24,6 +24,11 @@ tags:
 
 ---
 
+We got boared in training, instead watching this in loop :P
+
+https://github.com/user-attachments/assets/1394f326-0041-4ad6-b44c-1c7fcffccd04
+
+--- 
 ## Why Pyre vs. existing environments
 
 | Feature | `grid_world` | `maze_env` | `wildfire_env` | **Pyre** |
