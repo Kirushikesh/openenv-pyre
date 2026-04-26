@@ -13,14 +13,6 @@ const DOOR_CLOSED = 3;
 const EXIT        = 4;
 const OBSTACLE    = 5;
 
-/**
- * Map raw fire intensity (often 0.1–0.35 while smoldering / spreading) to a
- * stronger draw weight so corridor and door-adjacent cells read clearly under fog.
- */
-function fireDrawWeight(raw: number): number {
-  return Math.min(1, 0.12 + 0.88 * Math.min(1, raw));
-}
-
 /* ── Wind direction vectors ── */
 const WIND_DIRS: Record<string, [number, number]> = {
   N: [0, -1], S: [0, 1], E: [1, 0], W: [-1, 0],
@@ -295,11 +287,10 @@ const Map2D: React.FC<Map2DProps> = ({ observation, agentMoveFlash }) => {
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const fire = fire_grid[idx(x, y)];
-        if (fire < 0.035) continue;
+        if (fire < 0.1) continue;
         const px = x * cs + cs / 2, py = y * cs + cs / 2;
-        const fw = fireDrawWeight(fire);
         const radius = cs * (1.2 + fire * 1.8);
-        const a = Math.min(0.85, fw * 0.9);
+        const a = Math.min(0.85, fire * 0.9);
         const gr = ctx.createRadialGradient(px, py, 0, px, py, radius);
         gr.addColorStop(0,   `rgba(255,80,0,${a})`);
         gr.addColorStop(0.4, `rgba(220,40,0,${a * 0.5})`);
@@ -370,10 +361,7 @@ const Map2D: React.FC<Map2DProps> = ({ observation, agentMoveFlash }) => {
       for (let x = 0; x < W; x++) {
         const key = `${x},${y}`;
         if (!visible.has(key)) {
-          const f = fire_grid[idx(x, y)];
-          /* Let smolder / spread show through — uniform 0.55 grey hid weak corridor fire */
-          const fogA = f > 0.18 ? 0.08 : f > 0.08 ? 0.18 : f > 0.025 ? 0.32 : 0.55;
-          ctx.fillStyle = `rgba(140,134,126,${fogA})`;
+          ctx.fillStyle = 'rgba(140,134,126,0.55)';
           ctx.fillRect(x * cs, y * cs, cs, cs);
         }
       }
@@ -383,10 +371,10 @@ const Map2D: React.FC<Map2DProps> = ({ observation, agentMoveFlash }) => {
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
         const fire = fire_grid[idx(x, y)];
-        if (fire < 0.025) continue;
+        if (fire < 0.05) continue;
         const px = x * cs + cs / 2, py = y * cs + cs / 2;
         const flicker = 0.80 + 0.20 * Math.sin(t * 11.0 + x * 3.1 + y * 2.7);
-        const eff = Math.min(1, fireDrawWeight(fire) * flicker);
+        const eff = Math.min(1, fire * flicker);
         const isVisible = visible.has(`${x},${y}`);
 
         const windDx = wv[0] * cs * 0.25 * eff;
@@ -395,11 +383,10 @@ const Map2D: React.FC<Map2DProps> = ({ observation, agentMoveFlash }) => {
         /* Wide warning beacon glow for fire in fog — always shown */
         if (!isVisible) {
           const beaconPulse = 0.6 + 0.4 * Math.sin(t * 6.0 + x * 1.7 + y * 2.3);
-          const beaconR = cs * (1.55 + beaconPulse * 0.75);
-          const b = Math.min(1, eff * 1.35);
+          const beaconR = cs * (1.4 + beaconPulse * 0.6);
           const beaconGr = ctx.createRadialGradient(px, py, 0, px, py, beaconR);
-          beaconGr.addColorStop(0,   `rgba(255,100,0,${b * beaconPulse * 0.90})`);
-          beaconGr.addColorStop(0.3, `rgba(255,60,0,${b * beaconPulse * 0.55})`);
+          beaconGr.addColorStop(0,   `rgba(255,100,0,${eff * beaconPulse * 0.85})`);
+          beaconGr.addColorStop(0.3, `rgba(255,60,0,${eff * beaconPulse * 0.50})`);
           beaconGr.addColorStop(1,   'rgba(220,30,0,0)');
           ctx.fillStyle = beaconGr;
           ctx.beginPath(); ctx.arc(px, py, beaconR, 0, Math.PI * 2); ctx.fill();

@@ -219,9 +219,7 @@ class FireSim:
                     if fire_grid[i] >= FIRE_BURNING:
                         new_burn_timers[i] = burn_timers[i] + 1
                     if new_burn_timers[i] >= self.burnout_ticks and new_fire[i] >= 1.0:
-                        # Doors burn away to open floor (passage stays navigable).
-                        # Everything else (furniture, walls that caught fire, etc.) becomes rubble.
-                        cell_grid[i] = FLOOR if ct in (DOOR_OPEN, DOOR_CLOSED) else OBSTACLE
+                        cell_grid[i] = OBSTACLE
                         new_fire[i] = 0.0
                         new_burn_timers[i] = 0
                         burned_out.append((x, y))
