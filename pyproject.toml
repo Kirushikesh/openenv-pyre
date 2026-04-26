@@ -42,6 +42,17 @@ train = [
     "jupyter>=1.1.1",
     "flash-attn>=2.7.0",
 ]
+# Unsloth-backed training (replaces raw TRL + vLLM stack for train_grpo_unsloth.py)
+# Variant is fixed: A100 (Ampere) + CUDA 12.4, inferred from flashinfer==0.6.3 in train extra.
+# Unsloth bundles its own vLLM & transformers builds.
+train-unsloth = [
+    "unsloth[cu124-ampere-torch260]",
+    "trl==0.22.2",
+    "datasets>=4.8.4",
+    "tensorboard>=2.20.0",
+    "tornado>=6.5.5",
+    "jupyter>=1.1.1",
+]
 
 [project.scripts]
 # Server entry point - enables running via: uv run --project . server
