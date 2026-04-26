@@ -10,7 +10,7 @@ Pyre is a partial-observability crisis navigation environment:
   - Doors: Can be opened/closed to slow fire spread (+0.5 strategic door bonus)
   - Health: 100 HP, drains from smoke (0.5–5/step) and fire (10/step)
 
-=== ACTION SPACE (37 discrete) ===
+=== ACTION SPACE (37 discrete; no `look` — grid encoder carries visibility) ===
   0–3   : move(north|south|west|east)
   4     : wait()
   5–20  : door(door_1..16, open)
@@ -24,28 +24,33 @@ Pyre is a partial-observability crisis navigation environment:
     • smoke density  [0, 1]
     • visibility mask (1=visible, 0=unseen)
     • agent position mask
-  Global scalars (22): health, step_progress, fire_spread, humidity,
-    agent_x, agent_y, exit_distance, reachable_exits, visible_cells,
-    fire_sources, smoke_severity, alive, evacuated, wind (one-hot 5), difficulty (one-hot 3)
-  Frame stacking: 4 consecutive frames → input_dim = 5782 × 4 = 23128
+  Global scalars (17) + exit compass (3) + one-hots: wind (5) + difficulty (4) + route hint (4)
+  Frame stacking: 4 consecutive frames → input_dim = 5790 × 4 = 23160
 
-=== REWARD STRUCTURE ===
+=== REWARD STRUCTURE (environment: server/rubrics.py) ===
   Per-step:
-    -0.01  time penalty (urgency)
-    +0.10  BFS progress toward nearest unblocked exit
-    -0.05  regression (moved farther from exit)
-    +0.05  safe-progress bonus (progress through smoke-free cell)
-    -0.50  danger penalty (moved into smoke≥moderate or fire-adjacent)
-    -0.02×dmg health drain penalty
-    +0.50  strategic door close (adjacent to fire, once per door per episode)
-    +0.02  exploration bonus (first visit to cell)
+    -0.01  time penalty
+    +0.25  BFS progress toward nearest unblocked exit (move only)
+    -0.15  BFS regression (move only)
+    +0.05  safe-progress bonus (move, progress, new cell smoke < 0.5)
+    -0.50  danger (move into smoke ≥ 0.5 or cell adjacent to fire ≥ 0.3)
+    -0.02×dmg  health drain (dmg = HP lost this step)
+    +0.50  strategic door close (door tile cardinally adjacent to fire ≥ 0.3; once per door / ep)
+    +0.02  exploration (move to first-time cell)
   Terminal:
     +5.00  evacuation success
-    +1.50×(hp/100) health survival bonus (max +1.5)
+    +1.50×(hp/100)  health survival on evac
     -10.0  death
-    -5.00  timeout
-    0→+3.0 near-miss partial credit (based on closest exit approach)
-    +0.05×remaining_steps time bonus
+    -5.0  timeout if no reachable exit (all blocked), else −5 − 3×(hp/100)
+    0→+3.0  near-miss on death: max(0, 3 − 0.5×min BFS exit dist reached)
+    +0.05×remaining_steps  time bonus on evac
+
+  Extra shaping (this file only, applied to returned step reward before PPO):
+    -0.05  if action is wait()
+    -0.15  if move lands in a cell with a cardinal neighbor fire > 0.15
+    -0.20  if move revisits a position in the last 12 cells
+    +max(0, 0.25 − 0.04×d)  on move if not evacuated: d = Manhattan distance
+                            to nearest exit cell (from map_state.exit_positions)
 
 === ALGORITHM: PPO (Proximal Policy Optimization) ===
 WHY PPO over alternatives:
@@ -463,7 +468,7 @@ class ActorCritic(nn.Module):
          Policy head (→ logits)        Value head (→ scalar)
 
     LayerNorm before activations improves gradient flow for the large
-    (23128-dim) flat input without requiring feature normalization.
+    (23,160-dim stacked) flat input without requiring feature normalization.
     """
 
     def __init__(self, input_dim: int, action_dim: int, hidden_sizes: Tuple[int, ...] = (512, 256, 128)):

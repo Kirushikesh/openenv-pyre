@@ -175,3 +175,5 @@ outputs/
 run_training_openenv.sh
 frontend_new_desgin/
 node_modules/
+
+.claude/

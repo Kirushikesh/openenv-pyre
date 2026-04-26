@@ -19,7 +19,7 @@ tags:
 **Links:**
 🔥 [Live Space](https://krooz-pyre-env.hf.space) &nbsp;|&nbsp;
 🤖 [Trained Model](https://huggingface.co/Krooz/pyre-ppo-agent) &nbsp;|&nbsp;
-📓 [Colab Training](https://colab.research.google.com/drive/1ojC55qKXMVRXdjKeG5dUHiA5RBOBxA9V?usp=sharing) &nbsp;|&nbsp;
+📓 [Colab Training](https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing) &nbsp;|&nbsp;
 📝 [Blog](BLOG.md)
 
 ---
@@ -146,8 +146,8 @@ pyre_env/
 │
 ├── training/
 │   ├── ppo/
-│   │   ├── train_torch_ppo.py       In-process PPO (imports PyreEnvironment directly)
-│   │   ├── train_torch_ppo_http.py  HTTP-based PPO (trains against live server)
+│   │   ├── train_torch_ppo.py       PPO (in-process or `--server` for HTTP EnvClient)
+│   │   ├── train_torch_ppo_http.py  Thin wrapper: forwards argv to `train_torch_ppo.py --server ...`
 │   │   └── pyre_ppo_training.ipynb  Colab notebook (self-contained, talks to HF Space)
 │   └── push_to_hub.py               Upload checkpoint + metrics to HuggingFace Hub
 │
@@ -285,10 +285,14 @@ The same state is also exposed as structured fields in `PyreObservation` (smoke 
 | `HealthSurvivalBonus` | +1.5 × (hp/100) | Agent evacuated (range 0 → +1.5) |
 | `SelfDeathPenalty` | −10.0 | Agent died (HP ≤ 0) |
 | `TimeoutPenalty` | −5.0 to −8.0 | Alive but out of steps; scaled by `−5 − 3×(hp/100)` when exits were reachable |
-| `NearMissBonus` | max(0, 3.0 − 0.5 × min_dist) | On death only; partial credit for close exit approach |
+| `NearMissBonus` | max(0, 3.0 − 0.5 × min_BFS_dist) | On death only; `min_BFS_dist` = closest BFS distance to any exit reached this episode |
 | `TimeBonus` | +0.05 × remaining_steps | Agent evacuated |
 
-**BFS note:** `ProgressReward`, `ProgressRegressionPenalty`, `SafeProgressBonus`, and `NearMissBonus` all use true BFS traversal distance (walls and obstacles block; closed doors are treated as passable so the reward models optimal reachability assuming doors can be opened). Manhattan distance is never used for rewards.
+**BFS note:** `ProgressReward`, `ProgressRegressionPenalty`, `SafeProgressBonus`, and `NearMissBonus` all use true BFS traversal distance (walls and obstacles block; closed doors are treated as passable so the reward models optimal reachability assuming doors can be opened). The PPO trainer’s exit “pull” (below) uses **Manhattan** distance to listed exit cells only for an extra shaping signal — it is not part of the environment rubric.
+
+### PPO training script only (`training/ppo/train_torch_ppo.py`)
+
+The server’s step reward above is **further adjusted** inside the training loop (not returned to HTTP clients): **−0.05** on `wait`; **−0.15** after a `move` if any cardinal neighbor has fire **> 0.15**; **−0.20** if the new position was already in the last **12** positions this episode; **+ max(0, 0.25 − 0.04 × d)** on `move` when not yet evacuated, where **d** is **Manhattan** distance to the nearest cell in `map_state.exit_positions`.
 
 ---
 
@@ -347,22 +351,23 @@ python training/ppo/train_torch_ppo.py \
 
 ### 2. HTTP (against live server)
 
+`train_torch_ppo_http.py` is a thin wrapper; it runs `train_torch_ppo.py` with `--server http://localhost:8000` and passes through any other flags.
+
 ```bash
 # Start server first
 uv run server
 
-python training/ppo/train_torch_ppo_http.py \
-  --url http://localhost:8000 \
-  --episodes 300
+# Equivalent: python training/ppo/train_torch_ppo.py --server http://localhost:8000 --episodes 300
+python training/ppo/train_torch_ppo_http.py --episodes 300
 ```
 
 ### 3. Colab notebook (against HF Space)
 
-Open [`training/ppo/pyre_ppo_training.ipynb`](training/ppo/pyre_ppo_training.ipynb) or the [hosted Colab](https://colab.research.google.com/drive/1ojC55qKXMVRXdjKeG5dUHiA5RBOBxA9V?usp=sharing). The notebook points `SERVER_URL` at `https://krooz-pyre-env.hf.space` and trains entirely over HTTP.
+Open [`training/ppo/pyre_ppo_training.ipynb`](training/ppo/pyre_ppo_training.ipynb) or the [hosted Colab](https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing). The notebook points `SERVER_URL` at `https://krooz-pyre-env.hf.space` and trains entirely over HTTP.
 
 ### Observation encoding
 
-The `ObservationEncoder` in `train_torch_ppo.py` encodes each `PyreObservation` into a **5,785-dim float32 vector**:
+The `ObservationEncoder` in `train_torch_ppo.py` encodes each `PyreObservation` into a **5,790-dim float32 vector** (`ObservationEncoder.base_dim`):
 
 ```
 Grid:    24×24 × 10 channels = 5,760
@@ -377,41 +382,48 @@ Scalars: 17 global features
          agent_x_norm, agent_y_norm, nearest_exit_distance,
          reachable_exit_count, visible_cell_count, fire_sources,
          smoke_severity, alive, evacuated,
-         exit_dx_norm, exit_dy_norm, exit_manhattan_norm   ← exit compass (Fix 3)
+         exit_dx_norm, exit_dy_norm, exit_manhattan_norm   ← exit compass (map-agnostic)
 
-One-hots: wind (5) + difficulty (3) = 8
+One-hots: wind (5) + difficulty (4: easy, medium, hard_fixed, hard) + route hint (4: N/S/W/E) = 13
 
-Total: 5,760 + 17 = 5,777 + 8 = 5,785
+Total: 5,760 + 17 + 13 = 5,790
 ```
 
-With `--history-length 4` (default), four frames are stacked: **input_dim = 23,140**.
+With `--history-length 4` (default), four frames are stacked: **input_dim = 23,160**.
 
 ### Network architecture
 
 ```
-Input (23,140)
+Input (23,160)
   → LayerNorm → FC(512) → LayerNorm → ReLU
   → FC(256)   → LayerNorm → ReLU
   → FC(128)   → ReLU
-       ├── Policy head → FC(41) logits + action mask (−∞ for invalid)
+       ├── Policy head → FC(37) logits + action mask (−∞ for invalid)
        └── Value head  → FC(1) scalar
 ```
 
-Orthogonal init (√2 gain hidden layers, 0.01 policy head). Total parameters: ~12.3M.
+The policy uses **37** discrete actions (4 move, 1 wait, 16 door-open, 16 door-close); `look` is not in the PPO head because the map encoder already carries visibility. Orthogonal init (√2 gain hidden layers, 0.01 policy head). Total parameters: **~12.1M** (varies slightly with `hidden-sizes`).
+
+### Default PPO / curriculum flags
+
+- `--difficulty-schedule` default: `easy,medium,hard_fixed,hard` (full three-stage path including two hard modes).
+- Patience (defaults): threshold **0.65**, window **15** episodes, optional `--hard-mix-ratio` / `--hard-mix-dist` during the hard stage.
 
 ### Curriculum
 
 The `PatienceCurriculum` gating:
 
 ```
-Stay on current difficulty until:
+Stay on current stage until:
   success_rate (last 30 eps) ≥ patience_threshold (default 0.65)
   for patience_window (default 15) consecutive episodes
-→ then advance to next difficulty
+→ then advance to the next stage in --difficulty-schedule
 
-Hard phase: 25% of episodes replay on medium (--hard-mix-ratio 0.25)
-            to prevent catastrophic forgetting
+Final stage: optional replay of the previous stage (--hard-mix-ratio, default 0.25)
+             or a custom distribution (--hard-mix-dist), to limit forgetting
 ```
+
+With the default schedule `easy,medium,hard_fixed,hard`, the “replay” stage during **hard** is typically **`hard_fixed`**, not `medium`. The **`pyre_ppo_hard_v2`** run used an explicit `hard:…,medium:…,easy:…` mix instead; see `training/push_to_hub.py` for the exact flags.
 
 ### Push to HuggingFace Hub
 
@@ -419,28 +431,19 @@ Hard phase: 25% of episodes replay on medium (--hard-mix-ratio 0.25)
 export HF_TOKEN=hf_...
 uv run python training/push_to_hub.py \
   --repo-id Krooz/pyre-ppo-agent \
-  --stem pyre_ppo_fixed \
+  --stem pyre_ppo_hard_v2 \
   --artifacts-dir artifacts
 ```
 
-Uploads `{stem}.pt`, `{stem}.csv`, `{stem}.png`, `{stem}_eval.csv`, and generates a model card README. Trained weights: **[Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent)**.
+Uploads `{stem}.pt`, `{stem}.csv`, `{stem}.png`, `{stem}_eval.csv`, and generates a model card README. The script’s embedded summary targets the **`pyre_ppo_hard_v2`** HTTP run; adjust `--stem` if you use a different checkpoint prefix. Trained weights: **[Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent)**.
 
 ### Training results
 
-![Pyre PPO Training — 200 episodes, final success rate 75%](artifacts/pyre_ppo_fixed.png)
+![Pyre PPO — HTTP run `pyre_ppo_hard_v2`, 600 episodes, easy → medium → hard](artifacts/pyre_ppo_hard_v2.png)
 
-**200 episodes, patience-gated easy→medium curriculum.**
+**Primary run on record (`artifacts/pyre_ppo_hard_v2.*`): 600 HTTP episodes** with a patience-gated **easy → medium → hard** schedule, eval every 25 episodes on **hard** (see `training/push_to_hub.py` for the exact CLI, metrics table, and hub model-card text). Representative headline numbers from that run: **~55%** final training success rate (MA-20, graph title), **~52.7%** overall evacuation over all 600 episodes, and **~10.5%** evacuation on **hard** episodes within the run—showing the agent still struggles on fully procedural hard maps while improving on easy/medium.
 
-| Phase | Episodes | Final success rate | Notes |
-|---|---|---|---|
-| Easy | ~1–100 | ~90% | Reward climbs from −15 to +15 within 30 eps |
-| Medium | ~100–200 | **75%** | Dip at transition, recovers within 25 eps |
-
-Key observations from the curves:
-- Raw episode reward (grey) is noisy due to stochastic fire; MA-20 (orange) shows clean monotone improvement within each phase
-- The success rate drop at episode ~100 is the curriculum gating working correctly — medium difficulty introduces wind, denser fire, and shorter time limits simultaneously
-- Evaluation checkpoints (blue diamonds) confirm near-100% on easy before the gate advances
-- Final 75% success rate on medium vs ~3% for the random baseline
+**Earlier ablation (200 episodes, easy → medium only):** a previous curve reached **~75%** success on **medium** after 200 episodes (no `hard` in the training mix). That artifact set is no longer in the tree; the figure and CSV above supersede it for the hackathon write-up.
 
 ---
 

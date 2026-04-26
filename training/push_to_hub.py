@@ -1,20 +1,20 @@
 """
 push_to_hub.py — Upload Pyre PPO training artifacts to the Hugging Face Hub.
 
-Uploads files resolved by ``--stem`` (e.g. ``pyre_ppo_fixed.pti`` → Hub ``model.pt``).
+Uploads files resolved by ``--stem`` (e.g. ``pyre_ppo_hard_v2.pt`` → Hub ``model.pt``).
 
 Also uploads a **hardcoded** model card (README.md) documenting the
-``pyre_ppo_fixed`` HTTP training run (metrics taken from ``artifacts/``).
+``pyre_ppo_hard_v2`` HTTP training run (metrics from ``artifacts/pyre_ppo_hard_v2_*``).
 
 Usage
 ─────
   python training/push_to_hub.py \\
       --repo-id your-hf-username/pyre-ppo-agent \\
-      --stem pyre_ppo_fixed \\
+      --stem pyre_ppo_hard_v2 \\
       --token $HF_TOKEN
 
   # Private repo:
-  python training/push_to_hub.py --repo-id krooz/pyre-ppo-agent --stem pyre_ppo_fixed --private --token $HF_TOKEN
+  python training/push_to_hub.py --repo-id krooz/pyre-ppo-agent --stem pyre_ppo_hard_v2 --private --token $HF_TOKEN
 """
 
 from __future__ import annotations
@@ -26,12 +26,12 @@ from typing import Optional
 
 # Colab link (same as pyre_env/README.md — Training section)
 PYRE_PPO_COLAB_URL = (
-    "https://colab.research.google.com/drive/1ojC55qKXMVRXdjKeG5dUHiA5RBOBxA9V?usp=sharing"
+    "https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing"
 )
 
 
 def build_hub_model_card(repo_id: str, model_filename: str = "model.pt") -> str:
-    """Hardcoded README for the ``pyre_ppo_fixed`` run (from ``artifacts/pyre_ppo_fixed_*``)."""
+    """Hardcoded README for the ``pyre_ppo_hard_v2`` run (``artifacts/pyre_ppo_hard_v2_*``)."""
     return f"""---
 tags:
   - openenv
@@ -51,60 +51,100 @@ fire-evacuation environment (OpenEnv Hackathon, Apr 2026).
 > The Hugging Face hosted Inference API cannot run it directly.
 > Use the inference code below to load and run it locally.
 
-## Training summary (artifact run: ``pyre_ppo_fixed``)
+## Training summary (artifact run: ``pyre_ppo_hard_v2``)
 
-Values below are from ``artifacts/pyre_ppo_fixed.csv``, ``pyre_ppo_fixed_eval.csv``,
-and ``artifacts/pyre_ppo_fixed_training.log`` (HTTP trainer, env server at ``http://localhost:8000``).
+Values below are from ``artifacts/pyre_ppo_hard_v2.csv``, ``pyre_ppo_hard_v2_eval.csv``,
+``pyre_ppo_hard_v2.png`` (MA-**20** curves match ``save_training_graph_png`` in ``train_torch_ppo.py``),
+and ``artifacts/pyre_ppo_hard_v2_training.log`` (HTTP trainer via ``train_torch_ppo_http.py``, env at ``http://localhost:8000``).
 
 | Metric | Value |
 |--------|-------|
-| Total episodes | **200** |
-| Wall-clock training time | **~48 s** (~4.2 eps/s on CPU) |
-| Final success rate (rolling last 30 ep) | **80%** |
-| Final reward mean (rolling last 30 ep) | **+8.446** |
-| Curriculum | **Static** ``easy,medium`` (≈100 eps each; ``--patience-threshold 0``) |
-| Eval cadence | Every **20** episodes, **3** deterministic rollouts |
-| Eval difficulty | **medium** (per eval log / ``pyre_ppo_fixed_eval.csv``) |
+| Total episodes | **600** |
+| Wall-clock training time | **~227 s** (~2.6 eps/s) |
+| Final success rate (MA-20, training graph title) | **55%** |
+| Final reward mean (MA-20) | **+3.21** |
+| Final success rate (rolling last 30 ep, CSV ``s30`` / log) | **47%** |
+| Overall evacuation rate (all 600 ep, CSV) | **52.7%** |
+| Per-difficulty evacuation (easy / medium / hard) | **67.7%** / **59.5%** / **10.5%** |
+| Curriculum | **easy → medium → hard** with patience gate (**0.70** over **20** ep); hard-phase mix **hard:0.4, medium:0.4, easy:0.2** |
+| Eval cadence | Every **25** episodes, **5** deterministic rollouts |
+| Eval difficulty | **hard** (``pyre_ppo_hard_v2_eval.csv``) |
+
+### Training command (this run)
+
+```bash
+uv run python training/ppo/train_torch_ppo_http.py \\
+  --episodes 600 \\
+  --difficulty-schedule easy,medium,hard \\
+  --patience-threshold 0.70 \\
+  --patience-window 20 \\
+  --hard-mix-dist hard:0.4,medium:0.4,easy:0.2 \\
+  --update-every 8 \\
+  --update-epochs 6 \\
+  --eval-every 25 \\
+  --eval-difficulty hard \\
+  --eval-episodes 5 \\
+  --checkpoint-every 50 \\
+  --entropy-coef 0.05 \\
+  --step-delay 0 \\
+  --viz-after-ep 500 \\
+  --output artifacts/pyre_ppo_hard_v2.pt \\
+  --log-file artifacts/pyre_ppo_hard_v2_training.log
+```
 
 ## Network architecture (from training log)
 
 | Property | Value |
 |----------|-------|
-| Total parameters | **12,065,650** |
-| Input vector dim | **23,140** (encoder ``base_dim`` 5785 × **4** stacked frames) |
-| Action dim | **41** (4 move + 4 look + 1 wait + 16 door open + 16 door close) |
+| Total parameters | **~12.1M** (``ActorCritic`` with default 512/256/128) |
+| Input vector dim | **23,160** (encoder ``base_dim`` **5790** × **4** stacked frames) |
+| Action dim | **37** (4 move + 1 wait + 16 door open + 16 door close; no `look` in the PPO head) |
 | Hidden MLP | **512 → 256 → 128** |
 
-## Hyperparameters (defaults matching this run)
+## Hyperparameters (this run)
 
 | Param | Value |
 |-------|-------|
-| Learning rate | **3×10⁻⁴** |
+| Learning rate | **3×10⁻⁴** (with LR decay toward **0.1×** end factor unless disabled) |
 | PPO clip ε | **0.2** |
-| Entropy coeff | **0.03** |
+| Entropy coeff | **0.05** |
 | Value coeff | **0.5** |
 | Gamma | **0.99** |
 | GAE λ | **0.95** |
-| PPO update every | **5** episodes |
-| PPO epochs / minibatch | **4** / **256** |
+| PPO update every | **8** episodes |
+| PPO epochs / minibatch | **6** / **256** |
 | Max grad norm | **0.5** |
 | Observation mode | **visible** (partial observability) |
-| Device | **cpu** |
+| Device | **cuda** (``train_torch_ppo.py`` default; set ``--device cpu`` if needed) |
 
-### Evaluation checkpoints (from ``pyre_ppo_fixed_eval.csv``)
+### Periodic eval on **hard** (from ``pyre_ppo_hard_v2_eval.csv``)
 
 | Episode | Difficulty | Success rate | Reward mean | Steps mean |
 |---------|------------|--------------|-------------|------------|
-| 20 | medium | 100% | +15.698 | 7.0 |
-| 40 | medium | 100% | +15.640 | 4.3 |
-| 60 | medium | 100% | +16.887 | 9.0 |
-| 80 | medium | 100% | +15.162 | 10.3 |
-| 100 | medium | 67% | +6.008 | 57.0 |
-| 120 | medium | 67% | +6.401 | 32.7 |
-| 140 | medium | 100% | +16.283 | 6.3 |
-| 160 | medium | 100% | +16.573 | 8.3 |
-| 180 | medium | 100% | +16.397 | 8.0 |
-| 200 | medium | 67% | +6.807 | 14.7 |
+| 25 | hard | 0% | −10.124 | 58.0 |
+| 50 | hard | 0% | −11.184 | 58.4 |
+| 75 | hard | 0% | −11.468 | 35.6 |
+| 100 | hard | 0% | −9.827 | 74.0 |
+| 125 | hard | 20% | −7.792 | 25.0 |
+| 150 | hard | 40% | −4.238 | 28.0 |
+| 175 | hard | 20% | −6.674 | 35.2 |
+| 200 | hard | 0% | −12.304 | 74.6 |
+| 225 | hard | 0% | −11.080 | 100.0 |
+| 250 | hard | 20% | −5.648 | 38.4 |
+| 275 | hard | 0% | −10.368 | 76.2 |
+| 300 | hard | 20% | −4.421 | 72.8 |
+| 325 | hard | 0% | −11.180 | 48.2 |
+| 350 | hard | 0% | −9.845 | 74.0 |
+| 375 | hard | 0% | −11.320 | 26.4 |
+| 400 | hard | 0% | −12.256 | 34.0 |
+| 425 | hard | 20% | −7.024 | 36.4 |
+| 450 | hard | 0% | −10.726 | 56.4 |
+| 475 | hard | 0% | −9.072 | 88.6 |
+| 500 | hard | 0% | −12.050 | 66.6 |
+| 525 | hard | 20% | −5.528 | 41.6 |
+| 550 | hard | 0% | −11.274 | 52.4 |
+| 575 | hard | 0% | −10.578 | 58.4 |
+| 600 | hard | 0% | −12.068 | 36.6 |
 
 ## Files in this repository
 
@@ -277,8 +317,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--artifacts-dir", type=str, default="artifacts",
                    help="Directory containing the training artifacts")
     p.add_argument("--stem", type=str, default="pyre_ppo",
-                   help="Filename stem used when training, e.g. 'pyre_ppo_fixed' if your "
-                        "files are pyre_ppo_fixed.pti / pyre_ppo_fixed.png / etc.")
+                   help="Filename stem used when training, e.g. 'pyre_ppo_hard_v2' if your "
+                        "files are pyre_ppo_hard_v2.pt / .png / _eval.csv / etc.")
     p.add_argument("--token", type=str, default=None,
                    help="HuggingFace token (or set HF_TOKEN env var)")
     p.add_argument("--private", action="store_true",

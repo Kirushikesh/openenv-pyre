@@ -123,7 +123,7 @@ Pyre composes **14 rubric components** — each a Python class with a `.score()`
 
 Three of these deserve closer attention.
 
-**`NearMissBonus`** exists to prevent reward collapse on hard difficulty. When early training produces agents that die every episode, a flat −10 on all deaths gives zero gradient — every failure looks identical, the optimizer has nothing to differentiate. `NearMissBonus` uses the minimum BFS distance ever reached during the episode: `max(0, 3.0 − 0.5 × min_exit_dist)`. Dying 1 cell from an exit earns +2.5. Dying 12 cells away earns nothing. This single rubric is often the difference between hard-mode training converging and oscillating indefinitely.
+**`NearMissBonus`** exists to prevent reward collapse on hard difficulty. When early training produces agents that die every episode, a flat −10 on all deaths gives zero gradient — every failure looks identical, the optimizer has nothing to differentiate. `NearMissBonus` uses the minimum **BFS** distance ever reached during the episode to any exit: `max(0, 3.0 − 0.5 × min_exit_dist)`. Examples: distance **1** → +2.5, **3** → +1.5, **6** → 0; **7+** stays at 0. (Only applies on death, not timeout.)
 
 **`StrategicDoorBonus`** is an emergent-tactics incentive. The agent is never told that closing a door slows fire. It discovers this through reward — the action produces +0.50, and over many episodes that reward correlates with longer survival. The anti-gaming guard (a `rewarded_doors` set; each door earns the bonus at most once per episode) prevents the obvious exploit of opening and re-closing the same door.
 
@@ -133,19 +133,19 @@ Three of these deserve closer attention.
 
 ## Training with PPO
 
-The agent's observation is encoded into a **23,128-dimensional float32 vector**. The grid portion is a 24×24 padded map (sized for hard mode) with 10 channels: 6 one-hot cell type, fire intensity, smoke density, visibility mask, and agent position mask. The scalar portion is 17 features: health, step progress, fire parameters, agent coordinates, exit distance and count, visible cell count, smoke severity, alive/evacuated flags, and three **exit compass features** — signed (dx, dy) direction toward the nearest exit cell and normalized Manhattan distance.
+The agent's observation is encoded into a **23,160-dimensional float32 vector** (four stacked **5,790**-dim frames). The grid portion is a 24×24 padded map (sized for hard mode) with 10 channels: 6 one-hot cell type, fire intensity, smoke density, visibility mask, and agent position mask. The scalar portion is 17 features: health, step progress, fire parameters, agent coordinates, exit distance and count, visible cell count, smoke severity, alive/evacuated flags, and three **exit compass features** — signed (dx, dy) direction toward the nearest exit cell and normalized Manhattan distance. On top of that come one-hots for **wind (5)**, **difficulty (4: easy, medium, hard_fixed, hard)**, and a **shortest-path route hint (4)** toward the nearest exit from environment metadata (especially useful on procedural hard maps where raw Manhattan bearing can point into a wall).
 
 The exit compass was added after observing that agents trained on fixed layouts completely failed on procedurally generated hard-mode maps — they were navigating by memorized topology. The compass gives the policy a map-agnostic spatial anchor: a unit vector pointing from the agent to the nearest exit, recomputed from the live grid every step.
 
 **Four of these frames are stacked.** Fire has direction — a cell that was clear two steps ago and is heavy smoke now tells the agent exactly where fire is moving. Frame stacking makes temporal dynamics explicit without requiring recurrent architecture.
 
-**The action space is 41 discrete actions**: 4 move, 4 look, 1 wait, 16 door-open, 16 door-close. Each step's `available_actions_hint` list is converted into a binary validity mask applied as −∞ to policy logits before softmax — invalid moves are architecturally excluded, not penalized. Look actions are masked out during RL training entirely: the agent already receives the full grid; spending a step to look costs a turn and earns no reward.
+**The PPO head uses 37 discrete actions**: 4 move, 1 wait, 16 door-open, 16 door-close. Each step's `available_actions_hint` list is converted into a binary validity mask applied as −∞ to policy logits before softmax — invalid moves are architecturally excluded, not penalized. The **`look` action is not part of the PPO head**: the map encoder already encodes visibility, so the policy does not spend steps on a separate look action.
 
 The **ActorCritic** network uses a shared `LayerNorm → FC(512) → LayerNorm → ReLU → FC(256) → LayerNorm → ReLU → FC(128) → ReLU` backbone before splitting into policy and value heads. LayerNorm before activations handles the large flat input without requiring explicit normalization. Orthogonal initialization prevents saturated softmax from the first training step.
 
-**Curriculum learning is patience-gated.** The agent starts on `easy` and advances to `medium` only after achieving ≥65% evacuation rate over a 30-episode window, sustained for 15 episodes. The same gate holds at `medium → hard`. During the hard phase, 25% of episodes replay on medium to prevent catastrophic forgetting.
+**Curriculum learning is patience-gated.** The training script defaults to advancing from `easy` to `medium` to `hard_fixed` to `hard` when the recent success rate clears a patience threshold and streak (e.g. **0.65** over a rolling window, **15** consecutive qualifying episodes). During the hard stage you can **mix** difficulties (e.g. repeat **medium** or **easy** episodes) to limit forgetting; the default is a 25% medium replay **or** a custom `hard:…,medium:…,easy:…` distribution for long HTTP runs. The **`pyre_ppo_hard_v2`** checkpoint used a tighter gate and an explicit three-way mix; see `training/push_to_hub.py` for the exact command and numbers.
 
-Four additional reward shapings stack on top of the environment's signal: idle penalty (−0.05/wait), fire proximity warning (−0.15 when landing adjacent to fire), anti-loop penalty (−0.20 for revisiting a cell within the last 12 steps), and exit proximity pull — a continuous gradient toward exits that fires even before BFS progress kicks in.
+Four additional shapings are **added in the PPO training loop** on top of the environment step reward (the live server and random agent do not see these): **−0.05** on `wait`, **−0.15** after a `move` if any **cardinal** neighbor has fire **> 0.15** (stricter than the environment’s `≥ 0.3` danger rubric, which also checks your own cell’s smoke and neighbors’ fire at burning intensity), **−0.20** if the new position is already in the remembered last **12** cells, and **+ max(0, 0.25 − 0.04 × d)** on `move` (not yet evacuated) where **d** is **Manhattan** distance to the nearest **exit cell** in `map_state.exit_positions`.
 
 ---
 
@@ -157,15 +157,17 @@ Four additional reward shapings stack on top of the environment's signal: idle p
 
 The trained PPO agent ([Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent)) shows clear progression from the random baseline. The random agent — 70% hint-biased random actions, 30% fully random — produces negative cumulative rewards on medium difficulty in nearly every episode. It has no evacuation strategy, no fire avoidance, no concept of door mechanics.
 
-![Pyre PPO Training — 200 episodes, final success rate 75%. Orange line: reward moving average (MA-20). Teal line: success rate (MA-20). Blue diamonds: deterministic evaluation checkpoints. Green shading: easy phase. Orange shading: medium phase.](artifacts/pyre_ppo_fixed.png)
+![Pyre PPO — HTTP run `pyre_ppo_hard_v2`, 600 episodes, easy → medium → hard. Orange: reward MA-20. Teal: success rate MA-20. Blue diamonds: periodic eval on **hard**.](artifacts/pyre_ppo_hard_v2.png)
 
-*200 episodes, patience-gated curriculum. The agent starts from random behavior (reward ≈ −15) and climbs to ~+15 average reward within 30 episodes on easy. The sharp dip at episode ~100 is the curriculum advancing to medium difficulty — harder fire, more sources, any wind direction. By episode 200 the agent has recovered to a **75% evacuation success rate** on medium. Blue diamonds are deterministic evaluation runs; they hit near-100% on easy before the transition.*
+*600-episode run against a live server, full **easy → medium → hard** curriculum with patience gating and hard-phase difficulty mixing. Training success rate (MA-20) and reward rise through early stages; eval on **hard** stays noisy — procedural maps remain the hard frontier. See `training/push_to_hub.py` for the exact hyperparameters, per-difficulty evacuation breakdown, and hub-facing summary table.*
 
-The PPO agent learns across three measurable dimensions visible in the training curves:
+The PPO agent shows measurable learning, with an important caveat:
 
-1. **Evacuation rate climbs from ~0% to 75%** on medium difficulty in 200 episodes. The patience gate held on easy until the 30-episode success rate sustained above 65%, confirming mastery before escalation.
-2. **The dip is diagnostic, not failure.** The success rate drop from ~90% to ~60% exactly at the easy→medium boundary is the curriculum working as designed — the agent encountering new wind conditions and denser fire for the first time.
-3. **Health-on-exit improves** over training — the `HealthSurvivalBonus` gradient is working; later evacuations happen at higher HP than early ones, indicating the agent is finding cleaner, smoke-free routes rather than just any path out.
+1. **Easy and medium improve reliably** (high evacuation rates on those difficulties within the 600-episode `pyre_ppo_hard_v2` run). The patience gate and replay mix behave as a curriculum: the agent is not only memorizing a single template.
+2. **Hard (procedural 20×24) remains difficult** — single-digit to low double-digit success **within hard episodes** in that run, even as the policy gets better on easier floors. That gap is the honest result of training all three stages together: the headline “success” on the training chart blends difficulties, so read it next to the per-difficulty stats on the model card and eval CSVs.
+3. **Health-on-exit and reward** still trend toward safer routes on layouts where the policy succeeds, consistent with the `HealthSurvivalBonus` and rubric design.
+
+*An earlier 200-episode, easy→**medium**-only ablation once reached about **75%** success on **medium**; the repository’s committed training evidence and figure are now the **`pyre_ppo_hard_v2`** run above, which includes **hard** and different mixing/hyperparameters.*
 
 Full training metrics, reward curves, and model weights are on the [Hugging Face model card](https://huggingface.co/Krooz/pyre-ppo-agent). The Colab notebook for end-to-end replication runs directly against the live HuggingFace Space.
 
@@ -213,7 +215,7 @@ with PyreEnv(base_url="http://localhost:8000") as env:
     print(f"Reward: {result.reward:.3f} | HP: {result.observation.agent_health}")
 ```
 
-Train from scratch in Colab: [Pyre PPO Training Notebook](https://colab.research.google.com/drive/1ojC55qKXMVRXdjKeG5dUHiA5RBOBxA9V?usp=sharing)
+Train from scratch in Colab: [Pyre PPO Training Notebook](https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing)
 
 ---
 
@@ -233,10 +235,10 @@ Pyre is a foundation, not a finished product. The architecture — cellular auto
 
 ---
 
-Pyre isn't a toy. It's a physics-driven environment where every step costs health, every door is a tactical decision, and every exit might be on fire by the time the agent gets there. The agent doesn't get a map. It gets a first-person text paragraph, a structured grid, and 41 possible moves. And somewhere inside a 23,128-dimensional observation vector, a trained PPO policy has learned enough about burning buildings to find the exit — most of the time.
+Pyre isn't a toy. It's a physics-driven environment where every step costs health, every door is a tactical decision, and every exit might be on fire by the time the agent gets there. The agent doesn't get a map. It gets a first-person text paragraph, a structured grid, and 37 PPO policy actions (plus text-native `look` in the full env API). And somewhere inside a 23,160-dimensional observation vector, a trained PPO policy has learned enough about burning buildings to find the exit on easier floors most of the time — with procedural **hard** mode still a frontier worth pushing on.
 
 That seems like a hard problem to solve. It is. That's the point.
 
 ---
 
-*🔥 Space: [krooz-pyre-env.hf.space](https://krooz-pyre-env.hf.space) · Model: [Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent) · Training: [Colab Notebook](https://colab.research.google.com/drive/1ojC55qKXMVRXdjKeG5dUHiA5RBOBxA9V?usp=sharing)*
+*🔥 Space: [krooz-pyre-env.hf.space](https://krooz-pyre-env.hf.space) · Model: [Krooz/pyre-ppo-agent](https://huggingface.co/Krooz/pyre-ppo-agent) · Training: [Colab Notebook](https://colab.research.google.com/drive/1JPIajg0BAKEriNAwgGRnN7LXEcyCeiEV?usp=sharing)*
