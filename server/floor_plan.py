@@ -3,8 +3,8 @@ Floor plan templates and episode generation for Pyre.
 
 Three 16×16 hand-authored building templates:
   small_office  — two horizontal corridors + rooms, exits left/right
-  open_plan     — open hall with pillar obstacles, exits at diagonal corners
-  t_corridor    — T-shaped corridor network, three exits
+  open_plan     — open hall with pillar obstacles, exits mid west/east walls (4-dir friendly)
+  t_corridor    — T-shaped corridor network, three exits (west / east / south mid-wall)
 
 Cell encoding:
   0 = floor       1 = wall        2 = door_open
@@ -227,41 +227,43 @@ def _make_small_office() -> FloorPlan:
 #
 # Layout:
 #   Row  0: W W W W W W W W W W W W W W W W
-#   Row  1: E F F F F F F F F F F F F F F W  ← exit at (0,1)
+#   Row  1: W F F F F F F F F F F F F F F W
 #   Row  2: W F F F F F F F F F F F F F F W
 #   Row  3: W F F O O F F F F F O O F F F W  ← pillar obstacles
 #   Row  4: W F F O O F F F F F O O F F F W
-#   Row  5–10: open floor
+#   Row  5–7: open floor
+#   Row  8: E F F F F F F F F F F F F F F E  ← exits mid west/east (not corners)
+#   Row  9–10: open floor
 #   Row 11: W F F O O F F F F F O O F F F W
 #   Row 12: W F F O O F F F F F O O F F F W
 #   Row 13: W F F F F F F F F F F F F F F W
 #   Row 14: W F F F F F F F F F F F F F F W
-#   Row 15: W W W W W W W W W W W W W W W E  ← exit at (15,15)
+#   Row 15: W W W W W W W W W W W W W W W W
 # ---------------------------------------------------------------------------
 
 def _make_open_plan() -> FloorPlan:
     W, H = 16, 16
     rows = [
         [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # 0
-        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 1  exit at x=0
+        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 1
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 2
         [1, 0, 0, 5, 5, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 1],  # 3  pillars
         [1, 0, 0, 5, 5, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 1],  # 4
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 5
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 6
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 7
-        [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 8
+        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],  # 8  exits mid west/east
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 9
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 10
         [1, 0, 0, 5, 5, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 1],  # 11 pillars
         [1, 0, 0, 5, 5, 0, 0, 0, 0, 0, 5, 5, 0, 0, 0, 1],  # 12
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 13
         [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],  # 14
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4],  # 15 exit at x=15
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # 15
     ]
     grid = [c for row in rows for c in row]
 
-    exit_positions = [(0, 1), (15, 15)]
+    exit_positions = [(0, 8), (15, 8)]
     door_positions = []  # No internal doors in open plan
 
     floor_cells = [(x, y) for y in range(H) for x in range(W)
@@ -301,34 +303,34 @@ def _make_open_plan() -> FloorPlan:
 
 
 # ---------------------------------------------------------------------------
-# Template 3: t_corridor
+# Template 3: t_corridor  (HARD)
 #
 # T-shaped layout: vertical stem (x=7, y=0-14) + horizontal bar (y=7, x=0-15)
-# Side rooms off horizontal bar (y=8-12, left and right of stem):
+# Now with ENCLOSED north rooms (door-only access) on either side of the stem.
+# West and east exits are open floor (no door on the exit tiles).
 #
-#   Row  0: W W W W W W W E W W W W W W W W  ← exit at (7,0)
-#   Row 1-6: vertical stem only (x=7)
-#   Row  7: E F F F F F F F F F F F F F F E  ← horizontal bar + exits
-#   Row  8: W F F W F F W F W F F W F F F W  ← rooms branch off bar
-#   Row  9: W F F W F F W F W F F W F F F W
+#   Row  0: W W W W W W W W W W W W W W W W  ← no exit on top wall (4-dir: use side/bottom)
+#   Row 1-3: W F F F W W W F W W W F F F F W  ← NORTH rooms (left & right of stem)
+#   Row  4: W W D F F F F F F F F F F D W W  ← upper corridor + doors into north rooms
+#   Row 5-6: stem only (x=7)
+#   Row  7: E F F F F F F F F F F F F F F E  ← bar + exits (no doors at exits)
+#   Row 8-9, 11-12: side rooms below bar
 #   Row 10: W W D W W D W F W D W W W W D W  ← doors to stem
-#   Row 11: W F F W F F W F W F F W F F F W
-#   Row 12: W F F W F F W F W F F W F F F W
 #   Row 13-14: stem only
-#   Row 15: all walls
+#   Row 15: W W W W W W W E W W W W W W W W  ← south exit at (7,15)
 # ---------------------------------------------------------------------------
 
 def _make_t_corridor() -> FloorPlan:
     W, H = 16, 16
     rows = [
-        [1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 1, 1],  # 0  exit at x=7
-        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 1  stem
-        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 2
-        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 3
-        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 4
-        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 5
+        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # 0
+        [1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1],  # 1  NORTH rooms
+        [1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1],  # 2
+        [1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 1],  # 3
+        [1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1],  # 4  upper corridor + doors to north rooms
+        [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 5  stem
         [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 6
-        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],  # 7  horizontal + exits
+        [4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],  # 7  bar + exits (open at exits)
         [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1],  # 8  side rooms
         [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1],  # 9
         [1, 1, 2, 1, 1, 2, 1, 0, 1, 2, 1, 1, 1, 1, 2, 1],  # 10 doors to stem
@@ -336,19 +338,25 @@ def _make_t_corridor() -> FloorPlan:
         [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1],  # 12
         [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 13 stem continues
         [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1],  # 14
-        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # 15
+        [1, 1, 1, 1, 1, 1, 1, 4, 1, 1, 1, 1, 1, 1, 1, 1],  # 15  south exit (stem base)
     ]
     grid = [c for row in rows for c in row]
 
-    exit_positions = [(7, 0), (0, 7), (15, 7)]
-    door_positions = [(2, 10), (5, 10), (9, 10), (14, 10)]
+    exit_positions = [(7, 15), (0, 7), (15, 7)]
+    door_positions = [
+        (2, 4), (13, 4),                 # north room doors
+        (2, 10), (5, 10), (9, 10), (14, 10),  # south side-room doors
+    ]
 
-    # Spawn zones: horizontal bar + side rooms
+    # Spawn zones: horizontal bar + side rooms (north and south)
     bar_cells = [(x, 7) for x in range(1, 15) if grid[_idx(x, 7, W)] == 0]
-    room_cells = [(x, y) for y in range(8, 13) for x in range(1, 15)
-                  if grid[_idx(x, y, W)] == 0]
-    stem_cells = [(7, y) for y in range(1, 15) if grid[_idx(7, y, W)] == 0]
+    south_room_cells = [(x, y) for y in range(8, 13) for x in range(1, 15)
+                        if grid[_idx(x, y, W)] == 0]
+    north_room_cells = [(x, y) for y in range(1, 4) for x in range(1, 15)
+                        if grid[_idx(x, y, W)] == 0]
+    room_cells = south_room_cells + north_room_cells
 
+    # Agent can spawn on the bar or a few cells up the north stem
     agent_spawn = bar_cells + [(7, y) for y in range(4, 8) if grid[_idx(7, y, W)] == 0]
 
     zone_map: Dict[str, str] = {}
@@ -362,6 +370,9 @@ def _make_t_corridor() -> FloorPlan:
                     zone_map[f"{x},{y}"] = "north_wing"
                 elif x == 7 and y > 7:
                     zone_map[f"{x},{y}"] = "south_wing"
+                elif y < 7:
+                    # Enclosed north rooms — high fuel, low ventilation
+                    zone_map[f"{x},{y}"] = "north_offices"
                 elif x < 7:
                     zone_map[f"{x},{y}"] = "west_rooms"
                 else:

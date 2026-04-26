@@ -53,6 +53,7 @@ export interface SceneGraph {
 export interface SceneResponse {
   labels: SceneLabels;
   graph: SceneGraph;
+  error?: string;
 }
 
 export interface Observation {

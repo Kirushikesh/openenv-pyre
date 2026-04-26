@@ -10,12 +10,11 @@ Pyre is a partial-observability crisis navigation environment:
   - Doors: Can be opened/closed to slow fire spread (+0.5 strategic door bonus)
   - Health: 100 HP, drains from smoke (0.5–5/step) and fire (10/step)
 
-=== ACTION SPACE (41 discrete) ===
+=== ACTION SPACE (37 discrete) ===
   0–3   : move(north|south|west|east)
-  4–7   : look(north|south|west|east)  — scan without moving, still costs a step
-  8     : wait()
-  9–24  : door(door_1..16, open)
-  25–40 : door(door_1..16, close)
+  4     : wait()
+  5–20  : door(door_1..16, open)
+  21–36 : door(door_1..16, close)
   Runtime action masking via `available_actions_hint` prevents invalid moves.
 
 === OBSERVATION ENCODING ===
@@ -66,10 +65,10 @@ Key PPO improvements over the existing NumPy A2C (train_rl_agent.py):
   ✓ Better curriculum        3-stage easy→medium→hard with patience gating
 
 Usage:
-    python examples/train_torch_ppo.py --episodes 500 --device cuda
-    python examples/train_torch_ppo.py --episodes 300 --difficulty-schedule easy,medium,hard
-    python examples/train_torch_ppo.py --resume artifacts/pyre_ppo_checkpoint.pt
-    python examples/train_torch_ppo.py --describe-only
+    python training/ppo/train_torch_ppo.py --episodes 500 --device cuda
+    python training/ppo/train_torch_ppo.py --episodes 300 --difficulty-schedule easy,medium,hard_fixed,hard
+    python training/ppo/train_torch_ppo.py --resume artifacts/pyre_ppo_checkpoint.pt
+    python training/ppo/train_torch_ppo.py --describe-only
 """
 
 from __future__ import annotations
@@ -83,7 +82,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -135,22 +134,133 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Project imports — support both package install and direct run from root
 # ---------------------------------------------------------------------------
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 try:
-    from pyre_env.models import PyreAction, PyreObservation
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from pyre_env.models import PyreAction, PyreMapState, PyreObservation
     from pyre_env.server.pyre_env_environment import PyreEnvironment
 except ModuleNotFoundError:
     try:
-        from models import PyreAction, PyreObservation
+        from models import PyreAction, PyreMapState, PyreObservation
         from server.pyre_env_environment import PyreEnvironment
     except ModuleNotFoundError:
-        sys.exit(
-            "Cannot import Pyre modules. Run this script from the openenv-pyre root:\n"
-            "  python examples/train_torch_ppo.py"
+        # If we can't import the environment, we might still be able to run in HTTP mode
+        PyreEnvironment = None
+        try:
+            from models import PyreAction, PyreMapState, PyreObservation
+        except ImportError:
+            sys.exit(
+                "Cannot import Pyre modules. Run this script from the openenv-pyre root:\n"
+                "  python training/ppo/train_torch_ppo.py"
+            )
+
+
+# ---------------------------------------------------------------------------
+# HTTP environment wrapper
+# ---------------------------------------------------------------------------
+
+class HttpPyreEnv:
+    """Thin wrapper around the Pyre REST API.
+
+    Exposes the same ``reset()`` / ``step()`` interface as ``PyreEnvironment``
+    so the episode runner needs no changes.
+    """
+
+    def __init__(self, base_url: str = "http://localhost:8000", timeout: int = 15):
+        if requests is None:
+            raise ImportError("HTTP mode requires 'requests' package. Install with: pip install requests")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+
+    def _parse(self, data: Dict[str, Any]) -> PyreObservation:
+        """Convert a raw JSON response dict into a PyreObservation."""
+        obs_raw = data.get("observation", data)
+        ms_raw = obs_raw.get("map_state")
+        map_state = PyreMapState(**ms_raw) if ms_raw else None
+
+        # Ensure all fields are correctly typed
+        return PyreObservation(
+            narrative=obs_raw.get("narrative", ""),
+            agent_evacuated=obs_raw.get("agent_evacuated", False),
+            location_label=obs_raw.get("location_label", ""),
+            smoke_level=obs_raw.get("smoke_level", "none"),
+            fire_visible=obs_raw.get("fire_visible", False),
+            fire_direction=obs_raw.get("fire_direction"),
+            agent_health=float(obs_raw.get("agent_health", 100.0)),
+            health_status=obs_raw.get("health_status", "Good"),
+            wind_dir=obs_raw.get("wind_dir", "CALM"),
+            visible_objects=obs_raw.get("visible_objects", []),
+            blocked_exit_ids=obs_raw.get("blocked_exit_ids", []),
+            audible_signals=obs_raw.get("audible_signals", []),
+            elapsed_steps=obs_raw.get("elapsed_steps", 0),
+            last_action_feedback=obs_raw.get("last_action_feedback", ""),
+            available_actions_hint=obs_raw.get("available_actions_hint", []),
+            map_state=map_state,
+            reward=float(data.get("reward", 0.0)),
+            done=bool(data.get("done", False)),
+            metadata=data.get("metadata", {}),
         )
+
+    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Perform an HTTP request with exponential backoff for rate limits and 5xx errors."""
+        max_retries = 10
+        base_delay = 1.0
+        for i in range(max_retries):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+                if resp.status_code == 429:
+                    # Rate limited: wait and retry
+                    wait = base_delay * (2 ** i) + np.random.uniform(0, 1)
+                    print(f"  [http] Rate limited (429). Retrying in {wait:.1f}s... (attempt {i+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                if 500 <= resp.status_code < 600:
+                    # Server error: wait and retry
+                    wait = base_delay * (2 ** i)
+                    print(f"  [http] Server error ({resp.status_code}). Retrying in {wait:.1f}s... (attempt {i+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                if i == max_retries - 1:
+                    raise
+                wait = base_delay * (2 ** i)
+                print(f"  [http] Network error: {e}. Retrying in {wait:.1f}s... (attempt {i+1}/{max_retries})")
+                time.sleep(wait)
+        raise requests.exceptions.RetryError("Max retries exceeded")
+
+    def reset(self, difficulty: str = "easy", seed: Optional[int] = None) -> PyreObservation:
+        payload: Dict[str, Any] = {"difficulty": difficulty}
+        if seed is not None:
+            payload["seed"] = seed
+        resp = self._request_with_retry("POST", f"{self.base_url}/reset", json=payload, timeout=self.timeout)
+        return self._parse(resp.json())
+
+    def step(self, action: PyreAction) -> PyreObservation:
+        payload: Dict[str, Any] = {"action": action.action}
+        if action.direction: payload["direction"] = action.direction
+        if action.target_id: payload["target_id"] = action.target_id
+        if action.door_state: payload["door_state"] = action.door_state
+        resp = self._request_with_retry("POST", f"{self.base_url}/step", json=payload, timeout=self.timeout)
+        return self._parse(resp.json())
+
+    def health_check(self) -> bool:
+        try:
+            r = self.session.get(f"{self.base_url}/state", timeout=5)
+            return r.status_code < 500
+        except:
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Reuse the established observation/action interface from train_rl_agent.py
@@ -161,68 +271,45 @@ MAX_GRID_H = 24
 MAX_DOORS = 16
 DIRECTIONS = ("north", "south", "west", "east")
 WINDS = ("CALM", "NORTH", "SOUTH", "WEST", "EAST")
-DIFFICULTIES = ("easy", "medium", "hard")
+DIFFICULTIES = ("easy", "medium", "hard_fixed", "hard")
 
 MOVE_KEYS = [f"move(direction='{d}')" for d in DIRECTIONS]
-LOOK_KEYS = [f"look(direction='{d}')" for d in DIRECTIONS]
 WAIT_KEY = "wait()"
 OPEN_KEYS = [f"door(target_id='door_{i}', door_state='open')" for i in range(1, MAX_DOORS + 1)]
 CLOSE_KEYS = [f"door(target_id='door_{i}', door_state='close')" for i in range(1, MAX_DOORS + 1)]
-ACTION_KEYS = MOVE_KEYS + LOOK_KEYS + [WAIT_KEY] + OPEN_KEYS + CLOSE_KEYS
-ACTION_DIM = len(ACTION_KEYS)  # 41
+ACTION_KEYS = MOVE_KEYS + [WAIT_KEY] + OPEN_KEYS + CLOSE_KEYS
+ACTION_DIM = len(ACTION_KEYS)  # 37
 ACTION_TO_INDEX = {key: idx for idx, key in enumerate(ACTION_KEYS)}
 
 import re
 _MOVE_RE = re.compile(r"move\(direction='(north|south|west|east)'\)")
-_LOOK_RE = re.compile(r"look\(direction='(north|south|west|east)'\)")
 _DOOR_RE = re.compile(r"door\(target_id='(door_(\d+))', door_state='(open|close)'\)")
 
 
 def action_index_to_env_action(index: int) -> PyreAction:
     if 0 <= index < 4:
         return PyreAction(action="move", direction=DIRECTIONS[index])
-    if 4 <= index < 8:
-        return PyreAction(action="look", direction=DIRECTIONS[index - 4])
-    if index == 8:
+    if index == 4:
         return PyreAction(action="wait")
-    if 9 <= index < 9 + MAX_DOORS:
-        door_id = f"door_{index - 8}"
+    if 5 <= index < 5 + MAX_DOORS:
+        door_id = f"door_{index - 4}"
         return PyreAction(action="door", target_id=door_id, door_state="open")
-    door_slot = index - (9 + MAX_DOORS)
+    door_slot = index - (5 + MAX_DOORS)
     door_id = f"door_{door_slot + 1}"
     return PyreAction(action="door", target_id=door_id, door_state="close")
 
 
-def build_action_mask(observation: PyreObservation, exclude_look: bool = True) -> np.ndarray:
-    """Build a binary validity mask over the 41-action space.
-
-    exclude_look=True (default for RL):
-        Suppresses all 4 'look' actions. The RL agent already receives the full
-        grid via map_state — look gives zero new information but wastes a step
-        and earns no reward. Excluding it concentrates the policy on moves and
-        doors, which are the only actions that can improve the agent's position.
-
-    NOTE: Look action indices are 4–7 in ACTION_KEYS. The guard below must be
-    applied in the ACTION_TO_INDEX fast-path as well as the regex fallback,
-    because look hint strings exactly match ACTION_TO_INDEX keys and would
-    otherwise bypass the exclude_look flag entirely.
-    """
+def build_action_mask(observation: PyreObservation) -> np.ndarray:
+    """Build a binary validity mask over the 37-action PPO action space."""
     mask = np.zeros(ACTION_DIM, dtype=np.float32)
     for hint in observation.available_actions_hint:
         idx = ACTION_TO_INDEX.get(hint)
         if idx is not None:
-            if exclude_look and 4 <= idx <= 7:  # indices 4-7 are look(north/south/west/east)
-                continue
             mask[idx] = 1.0
             continue
         m = _MOVE_RE.fullmatch(hint)
         if m:
             mask[ACTION_TO_INDEX[f"move(direction='{m.group(1)}')"]] = 1.0
-            continue
-        m = _LOOK_RE.fullmatch(hint)
-        if m:
-            if not exclude_look:
-                mask[ACTION_TO_INDEX[f"look(direction='{m.group(1)}')"]] = 1.0
             continue
         m = _DOOR_RE.fullmatch(hint)
         if m:
@@ -242,16 +329,26 @@ class ObservationEncoder:
     Mode 'full': expose complete ground-truth grid — useful for debugging
         or oracle upper-bound experiments.
 
-    Output shape: (base_dim,) = (MAX_GRID_W × MAX_GRID_H × 10 + 25,) = (5785,)
-    With history stacking of k frames: (5785 × k,)
+    Output shape: (base_dim,) = padded_grid_features + global_features + wind + difficulty + route hint.
 
     The 3 extra scalars over the v1 baseline are map-agnostic exit-compass
     features (Fix 3): exit_dx_norm, exit_dy_norm, exit_manhattan_norm.
     These allow the agent to locate the nearest exit on procedurally generated
     maps without having to memorise layout-specific coordinates.
+
+    The 4 newest scalars are a one-hot shortest-path route hint derived from
+    the environment metadata: north / south / west / east. This is especially
+    useful on procedural hard maps where Manhattan direction can point into a
+    wall or dead-end corridor.
     """
 
-    base_dim = MAX_GRID_W * MAX_GRID_H * 10 + 25
+    base_dim = (
+        MAX_GRID_W * MAX_GRID_H * 10
+        + 17
+        + len(WINDS)
+        + len(DIFFICULTIES)
+        + len(DIRECTIONS)
+    )
 
     def __init__(self, mode: str = "visible"):
         if mode not in {"visible", "full"}:
@@ -301,6 +398,10 @@ class ObservationEncoder:
 
         wind_oh = np.zeros(len(WINDS), dtype=np.float32); wind_oh[wi] = 1.0
         diff_oh = np.zeros(len(DIFFICULTIES), dtype=np.float32); diff_oh[di] = 1.0
+        route_oh = np.zeros(len(DIRECTIONS), dtype=np.float32)
+        route_dir = str(meta.get("nearest_exit_direction", "") or "").lower()
+        if route_dir in DIRECTIONS:
+            route_oh[DIRECTIONS.index(route_dir)] = 1.0
 
         # Fix 3 — map-agnostic exit compass features.
         # Compute the direction vector and normalised Manhattan distance to the
@@ -344,7 +445,7 @@ class ObservationEncoder:
             exit_manhattan_norm,  # how far away the exit is (0 = here, 1 = max)
         ], dtype=np.float32)
 
-        return np.concatenate([grid_features, global_features, wind_oh, diff_oh]).astype(np.float32)
+        return np.concatenate([grid_features, global_features, wind_oh, diff_oh, route_oh]).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +531,10 @@ class ActorCritic(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample (or take greedy) action. Returns (action, log_prob, value)."""
         dist, values = self(obs, mask)
-        action = dist.mode if deterministic else dist.sample()
+        if deterministic:
+            action = torch.argmax(dist.probs, dim=-1)
+        else:
+            action = dist.sample()
         log_prob = dist.log_prob(action)
         return action, log_prob, values
 
@@ -522,7 +626,7 @@ class EpisodeResult:
 
 
 def run_episode(
-    env: PyreEnvironment,
+    env: Any,
     network: ActorCritic,
     encoder: ObservationEncoder,
     device: torch.device,
@@ -530,6 +634,8 @@ def run_episode(
     history_length: int,
     buffer: RolloutBuffer,
     deterministic: bool = False,
+    verbose: bool = False,
+    step_delay: float = 0.0,
 ) -> EpisodeResult:
     """Run one episode, appending transitions to *buffer*."""
     observation = env.reset(difficulty=difficulty)
@@ -542,7 +648,6 @@ def run_episode(
     evacuated = False
     steps = 0
     # Anti-loop tracking: remember the last LOOP_WINDOW positions this episode.
-    # Revisiting any of them means the agent is circling, not exploring.
     LOOP_WINDOW = 12
     recent_positions: deque = deque(maxlen=LOOP_WINDOW)
 
@@ -550,8 +655,7 @@ def run_episode(
     with torch.no_grad():
         while True:
             state_vec = np.concatenate(list(frames), dtype=np.float32)
-            # exclude_look=True: RL agent sees full grid — look wastes steps
-            action_mask = build_action_mask(observation, exclude_look=True)
+            action_mask = build_action_mask(observation)
 
             obs_t = torch.tensor(state_vec, dtype=torch.float32, device=device).unsqueeze(0)
             mask_t = torch.tensor(action_mask, dtype=torch.float32, device=device).unsqueeze(0)
@@ -560,25 +664,23 @@ def run_episode(
 
             action_idx = int(action_t.item())
             env_action = action_index_to_env_action(action_idx)
+
+            if step_delay > 0.0:
+                time.sleep(step_delay)
+
+            if verbose:
+                print(f"    step={steps+1:03d}  action={ACTION_KEYS[action_idx]:<40}  hp={observation.agent_health:5.1f}", flush=True)
+
             next_obs = env.step(env_action)
 
             reward = float(next_obs.reward or 0.0)
 
-            # ----------------------------------------------------------------
             # Reward shaping 1 — idle penalty
-            # The env's -0.01/step is too weak; make waiting explicitly costly.
-            # ----------------------------------------------------------------
             chosen_action = env_action.action
             if chosen_action == "wait":
                 reward -= 0.05
 
-            # ----------------------------------------------------------------
-            # Reward shaping 2 — fire-approach penalty (Fix 2)
-            # Penalise landing on (or moving next to) a cell with active fire.
-            # This is stronger than the env's DangerPenalty and fires *before*
-            # health drain accumulates, teaching the agent to predict spread.
-            # We look at the NEW observation's map to catch the current step.
-            # ----------------------------------------------------------------
+            # Reward shaping 2 — fire-approach penalty
             ms_next = next_obs.map_state
             if ms_next is not None and chosen_action.startswith("move"):
                 ax, ay = ms_next.agent_x, ms_next.agent_y
@@ -588,33 +690,20 @@ def run_episode(
                     nx, ny = ax + dx, ay + dy
                     if 0 <= nx < gw and 0 <= ny < gh:
                         if float(fire_grid[ny * gw + nx]) > 0.15:
-                            reward -= 0.15  # early fire-proximity warning
+                            reward -= 0.15
                             break
 
-            # ----------------------------------------------------------------
             # Reward shaping 3 — anti-loop penalty
-            # If the agent steps onto a cell it occupied in the last LOOP_WINDOW
-            # steps, it is circling. Penalise to force forward exploration.
-            # Fires only on move actions — wait is already penalised above.
-            # ----------------------------------------------------------------
             if ms_next is not None and chosen_action.startswith("move"):
                 cur_pos = (ms_next.agent_x, ms_next.agent_y)
                 if cur_pos in recent_positions:
-                    reward -= 0.2  # break the loop
+                    reward -= 0.2
                 recent_positions.append(cur_pos)
 
-            # ----------------------------------------------------------------
             # Reward shaping 4 — exit proximity pull
-            # Absolute (not just delta) distance-based bonus so the agent has
-            # a continuous gradient toward exits even before it learns
-            # consistent BFS progress.  Complements the server-side
-            # ProgressReward which only fires on a single step of BFS gain.
-            # Max +0.25 when adjacent; tapers to 0 beyond 6 cells (Manhattan).
-            # Only fires on move to avoid rewarding standing still near exits.
-            # ----------------------------------------------------------------
             if ms_next is not None and chosen_action.startswith("move") and not next_obs.agent_evacuated:
                 ax, ay = ms_next.agent_x, ms_next.agent_y
-                exits = ms_next.exit_positions  # List[List[int]] of [x, y]
+                exits = ms_next.exit_positions
                 if exits:
                     min_manhattan = min(abs(ax - ex[0]) + abs(ay - ex[1]) for ex in exits)
                     reward += max(0.0, 0.25 - 0.04 * min_manhattan)
@@ -673,8 +762,6 @@ def ppo_update(
     dones = np.array(buffer.dones, dtype=np.float32)
 
     returns, advantages = compute_gae(rewards, values, dones, gamma, gae_lambda)
-
-    # Normalize advantages across the whole batch (reduces variance)
     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     obs_arr = torch.tensor(np.stack(buffer.obs), dtype=torch.float32, device=device)
@@ -694,29 +781,21 @@ def ppo_update(
         perm = torch.randperm(T, device=device)
         for start in range(0, T, minibatch_size):
             idx = perm[start:start + minibatch_size]
-            if len(idx) < 2:
-                continue
+            if len(idx) < 2: continue
 
             log_prob, value, entropy = network.evaluate(obs_arr[idx], mask_arr[idx], action_arr[idx])
-
-            # PPO ratio and clipped surrogate loss
             ratio = torch.exp(log_prob - old_logp_arr[idx])
             adv_mb = adv_arr[idx]
             surr1 = ratio * adv_mb
             surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_mb
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Value loss with optional clipping (stabilises critic)
             ret_mb = return_arr[idx]
             old_val_mb = old_value_arr[idx]
             value_pred_clipped = old_val_mb + torch.clamp(value - old_val_mb, -value_clip_eps, value_clip_eps)
-            value_loss = torch.max(
-                F.mse_loss(value, ret_mb),
-                F.mse_loss(value_pred_clipped, ret_mb),
-            )
+            value_loss = torch.max(F.mse_loss(value, ret_mb), F.mse_loss(value_pred_clipped, ret_mb))
 
             entropy_loss = -entropy.mean()
-
             loss = policy_loss + value_coef * value_loss + entropy_coef * entropy_loss
 
             optimizer.zero_grad()
@@ -736,8 +815,7 @@ def ppo_update(
             n_updates += 1
 
     if n_updates > 0:
-        for k in metrics:
-            metrics[k] /= n_updates
+        for k in metrics: metrics[k] /= n_updates
     return metrics
 
 
@@ -746,7 +824,7 @@ def ppo_update(
 # ---------------------------------------------------------------------------
 
 def evaluate_policy(
-    env: PyreEnvironment,
+    env: Any,
     network: ActorCritic,
     encoder: ObservationEncoder,
     device: torch.device,
@@ -784,19 +862,16 @@ def save_training_graph_png(
     eval_rows: List[Dict],
     window: int = 20,
 ) -> None:
-    """Save a publication-quality PNG training graph with dual Y-axes."""
     try:
         import matplotlib
-        matplotlib.use("Agg")   # non-interactive backend — no display needed
+        matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.ticker as mticker
     except ImportError:
-        print("[warn] matplotlib not installed — skipping PNG graph. Run: uv pip install matplotlib")
+        print("[warn] matplotlib not installed — skipping PNG graph.")
         return
 
-    if not episode_rows:
-        return
-
+    if not episode_rows: return
     path.parent.mkdir(parents=True, exist_ok=True)
 
     episodes   = [int(r["episode"]) for r in episode_rows]
@@ -804,7 +879,6 @@ def save_training_graph_png(
     evacuated  = [float(r["evacuated"]) for r in episode_rows]
     difficulty = [str(r["difficulty"]) for r in episode_rows]
 
-    # Moving average helper
     def ma(values: list, w: int) -> list:
         out, run, q = [], 0.0, []
         for v in values:
@@ -815,13 +889,11 @@ def save_training_graph_png(
 
     reward_ma  = ma(rewards, window)
     success_ma = ma(evacuated, window)
-
-    eval_eps  = [int(r["episode"])      for r in eval_rows]
+    eval_eps  = [int(r["episode"]) for r in eval_rows]
     eval_succ = [float(r["success_rate"]) for r in eval_rows]
 
-    # Difficulty shading regions
     diff_colors = {"easy": "#d4edda", "medium": "#fff3cd", "hard": "#f8d7da"}
-    regions: List[tuple] = []
+    regions = []
     if difficulty:
         cur, start = difficulty[0], episodes[0]
         for ep, d in zip(episodes[1:], difficulty[1:]):
@@ -833,68 +905,34 @@ def save_training_graph_png(
     fig, ax1 = plt.subplots(figsize=(14, 6))
     ax2 = ax1.twinx()
 
-    # Shade difficulty regions
     for x0, x1, diff in regions:
         ax1.axvspan(x0, x1, color=diff_colors.get(diff, "#eeeeee"), alpha=0.35, zorder=0)
 
-    # Zero line
     ax1.axhline(0, color="#aaaaaa", linewidth=0.8, linestyle="--", zorder=1)
+    ax1.plot(episodes, rewards, color="#d1c7bc", linewidth=0.8, alpha=0.6, label="Episode reward", zorder=2)
+    ax1.plot(episodes, reward_ma, color="#c1661c", linewidth=2.5, label=f"Reward (MA-{window})", zorder=3)
+    ax2.plot(episodes, success_ma, color="#1a7a8a", linewidth=2.5, label=f"Success rate (MA-{window})", zorder=3)
 
-    # Raw reward (faint)
-    ax1.plot(episodes, rewards, color="#d1c7bc", linewidth=0.8,
-             alpha=0.6, label="Episode reward", zorder=2)
-
-    # Reward moving average
-    ax1.plot(episodes, reward_ma, color="#c1661c", linewidth=2.5,
-             label=f"Reward (MA-{window})", zorder=3)
-
-    # Success moving average (right axis)
-    ax2.plot(episodes, success_ma, color="#1a7a8a", linewidth=2.5,
-             linestyle="-", label=f"Success rate (MA-{window})", zorder=3)
-
-    # Eval checkpoints
     if eval_eps:
-        ax2.scatter(eval_eps, eval_succ, color="#0d5b6b", s=60, zorder=5,
-                    marker="D", label="Eval success", edgecolors="white", linewidths=1.2)
+        ax2.scatter(eval_eps, eval_succ, color="#0d5b6b", s=60, zorder=5, marker="D", label="Eval success", edgecolors="white", linewidths=1.2)
 
-    # Axes labels & formatting
-    ax1.set_xlabel("Episode", fontsize=13, fontweight="bold", labelpad=8)
-    ax1.set_ylabel("Reward", fontsize=13, fontweight="bold", color="#c1661c", labelpad=8)
-    ax2.set_ylabel("Success Rate", fontsize=13, fontweight="bold", color="#1a7a8a", labelpad=8)
-
-    ax1.tick_params(axis="y", labelcolor="#c1661c")
-    ax2.tick_params(axis="y", labelcolor="#1a7a8a")
+    ax1.set_xlabel("Episode", fontsize=13, fontweight="bold")
+    ax1.set_ylabel("Reward", fontsize=13, fontweight="bold", color="#c1661c")
+    ax2.set_ylabel("Success Rate", fontsize=13, fontweight="bold", color="#1a7a8a")
     ax2.set_ylim(-0.05, 1.05)
     ax2.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0, decimals=0))
-
-    ax1.grid(True, which="major", linestyle="--", linewidth=0.6,
-             color="#dddddd", alpha=0.8, zorder=0)
+    ax1.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.8)
     ax1.set_xlim(episodes[0], episodes[-1])
 
-    ax1.tick_params(axis="x", labelsize=10)
-    ax1.tick_params(axis="y", labelsize=10)
-    ax2.tick_params(axis="y", labelsize=10)
-
-    # Title
     total_eps = episodes[-1]
     final_sr  = success_ma[-1] if success_ma else 0.0
-    fig.suptitle(
-        f"Pyre PPO Training  —  {total_eps} episodes  |  final success rate: {final_sr:.0%}",
-        fontsize=14, fontweight="bold", y=1.01,
-    )
+    fig.suptitle(f"Pyre PPO Training  —  {total_eps} episodes  |  final success rate: {final_sr:.0%}", fontsize=14, fontweight="bold")
 
-    # Difficulty legend patches
     import matplotlib.patches as mpatches
-    diff_patches = [
-        mpatches.Patch(color=diff_colors[d], alpha=0.6, label=d.capitalize())
-        for d in ["easy", "medium", "hard"] if any(r == d for r in difficulty)
-    ]
-
-    # Combine legends from both axes
+    diff_patches = [mpatches.Patch(color=diff_colors[d], alpha=0.6, label=d.capitalize()) for d in ["easy", "medium", "hard"] if any(r == d for r in difficulty)]
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax2.get_legend_handles_labels()
-    ax1.legend(h1 + h2 + diff_patches, l1 + l2 + [p.get_label() for p in diff_patches],
-               loc="upper left", fontsize=9, framealpha=0.85)
+    ax1.legend(h1 + h2 + diff_patches, l1 + l2 + [p.get_label() for p in diff_patches], loc="upper left", fontsize=9, framealpha=0.85)
 
     fig.tight_layout()
     fig.savefig(path, dpi=150, bbox_inches="tight")
@@ -906,135 +944,59 @@ def save_training_graph_png(
 # ---------------------------------------------------------------------------
 
 def build_curriculum(schedule_str: str, n_episodes: int) -> List[str]:
-    """Expand comma-separated difficulty stages evenly over n_episodes.
-
-    Example: 'easy,medium,hard' with 300 episodes → 100 each.
-    Used only when patience_threshold=0 (static schedule).
-    """
     stages = [s.strip().lower() for s in schedule_str.split(",") if s.strip()]
-    if not stages:
-        stages = ["medium"]
+    if not stages: stages = ["medium"]
     for s in stages:
-        if s not in DIFFICULTIES:
-            raise ValueError(f"Unknown difficulty '{s}'. Choose from {DIFFICULTIES}.")
+        if s not in DIFFICULTIES: raise ValueError(f"Unknown difficulty '{s}'.")
     seg = max(1, n_episodes // len(stages))
     schedule = []
-    for s in stages:
-        schedule.extend([s] * seg)
-    while len(schedule) < n_episodes:
-        schedule.append(stages[-1])
+    for s in stages: schedule.extend([s] * seg)
+    while len(schedule) < n_episodes: schedule.append(stages[-1])
     return schedule[:n_episodes]
 
 
 def parse_mix_dist(spec: Optional[str]) -> Optional[Dict[str, float]]:
-    """Parse a 'hard:0.6,medium:0.3,easy:0.1' style spec into a dict.
-
-    Returns None when ``spec`` is falsy. Probabilities are renormalised to
-    sum to 1 if they don't already (within 1% tolerance).
-    """
-    if not spec:
-        return None
-    out: Dict[str, float] = {}
+    if not spec: return None
+    out = {}
     for chunk in spec.split(","):
         chunk = chunk.strip()
-        if not chunk:
-            continue
-        if ":" not in chunk:
-            raise ValueError(f"Invalid mix-dist entry '{chunk}', expected 'name:prob'")
+        if not chunk: continue
+        if ":" not in chunk: raise ValueError(f"Invalid mix-dist entry '{chunk}'")
         name, val = chunk.split(":", 1)
         out[name.strip().lower()] = float(val)
     total = sum(out.values())
-    if total <= 0:
-        raise ValueError(f"mix-dist probabilities must be positive, got {out}")
+    if total <= 0: raise ValueError(f"mix-dist probabilities must be positive")
     return {k: v / total for k, v in out.items()}
 
 
 class PatienceCurriculum:
-    """Dynamic difficulty scheduler that gates advancement on sustained success rate.
-
-    Stays on current difficulty until success_rate_30 >= threshold for
-    patience_window consecutive episodes, then advances to the next stage.
-    During the hard phase an optional mix_ratio fraction of episodes are
-    replayed on the previous (medium) difficulty to prevent catastrophic
-    forgetting of the medium policy.
-
-    Args:
-        stages:           ordered list of difficulty strings, e.g. ['easy','medium','hard']
-        threshold:        minimum success rate (0–1) required before advancing
-        patience_window:  number of consecutive episodes that must meet threshold
-        mix_ratio:        fraction of hard-phase episodes to run on medium instead (0–1).
-                          Ignored when ``mix_dist`` is provided.
-        mix_dist:         optional dict mapping difficulty -> probability used
-                          during the *final* (hard) stage, e.g.
-                          ``{"hard": 0.6, "medium": 0.3, "easy": 0.1}``. When set,
-                          each hard-phase episode samples its difficulty from this
-                          distribution. Probabilities must sum to 1.
-    """
-
-    def __init__(
-        self,
-        stages: List[str],
-        threshold: float,
-        patience_window: int,
-        mix_ratio: float = 0.0,
-        mix_dist: Optional[Dict[str, float]] = None,
-    ) -> None:
-        self.stages = stages
-        self.threshold = threshold
-        self.patience_window = patience_window
-        self.mix_ratio = mix_ratio
-        self.mix_dist = mix_dist
+    def __init__(self, stages: List[str], threshold: float, patience_window: int, mix_ratio: float = 0.0, mix_dist: Optional[Dict[str, float]] = None):
+        self.stages, self.threshold, self.patience_window = stages, threshold, patience_window
+        self.mix_ratio, self.mix_dist = mix_ratio, mix_dist
         self.stage_idx = 0
         self._streak = 0
-
         if self.mix_dist is not None:
-            total = sum(self.mix_dist.values())
-            if not (0.99 <= total <= 1.01):
-                raise ValueError(
-                    f"mix_dist probabilities must sum to 1, got {total:.3f}"
-                )
             for k in self.mix_dist:
-                if k not in self.stages:
-                    raise ValueError(
-                        f"mix_dist key '{k}' not in stages {self.stages}"
-                    )
+                if k not in self.stages: raise ValueError(f"mix_dist key '{k}' not in stages")
 
     @property
-    def current(self) -> str:
-        return self.stages[self.stage_idx]
+    def current(self) -> str: return self.stages[self.stage_idx]
 
     def step(self, success_rate_30: float) -> str:
-        """Call once per episode *after* appending to success_window.
-
-        Returns the difficulty to use for the *next* episode.
-        Also handles the final-stage cumulative-replay mix.
-        """
         if self.stage_idx < len(self.stages) - 1:
-            if success_rate_30 >= self.threshold:
-                self._streak += 1
-            else:
-                self._streak = 0
+            if success_rate_30 >= self.threshold: self._streak += 1
+            else: self._streak = 0
             if self._streak >= self.patience_window:
                 self.stage_idx += 1
                 self._streak = 0
-                print(
-                    f"  [curriculum] Advanced to '{self.current}' "
-                    f"(success_rate_30={success_rate_30:.2f} >= {self.threshold} "
-                    f"for {self.patience_window} eps)"
-                )
-
-        is_final_stage = self.stage_idx == len(self.stages) - 1
-
-        if is_final_stage and self.mix_dist is not None:
+                print(f"  [curriculum] Advanced to '{self.current}' (suc30={success_rate_30:.2f})")
+        is_final = self.stage_idx == len(self.stages) - 1
+        if is_final and self.mix_dist is not None:
             keys = list(self.mix_dist.keys())
-            probs = np.array([self.mix_dist[k] for k in keys], dtype=np.float64)
-            probs = probs / probs.sum()
-            return str(np.random.choice(keys, p=probs))
-
-        if is_final_stage and self.mix_ratio > 0.0 and len(self.stages) >= 2:
-            prev = self.stages[self.stage_idx - 1]
-            if np.random.rand() < self.mix_ratio:
-                return prev
+            probs = np.array([self.mix_dist[k] for k in keys])
+            return str(np.random.choice(keys, p=probs / probs.sum()))
+        if is_final and self.mix_ratio > 0.0 and len(self.stages) >= 2:
+            if np.random.rand() < self.mix_ratio: return self.stages[self.stage_idx - 1]
         return self.current
 
 
@@ -1042,362 +1004,148 @@ class PatienceCurriculum:
 # Checkpoint
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(
-    path: Path,
-    network: ActorCritic,
-    optimizer: Adam,
-    scheduler,
-    episode: int,
-    args: argparse.Namespace,
-) -> None:
+def save_checkpoint(path: Path, network: ActorCritic, optimizer: Adam, scheduler, episode: int, args: argparse.Namespace):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "episode": episode,
-        "network_state": network.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "scheduler_state": scheduler.state_dict() if scheduler else None,
-        "args": vars(args),
-    }, path)
+    torch.save({"episode": episode, "network_state": network.state_dict(), "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict() if scheduler else None, "args": vars(args)}, path)
 
-
-def load_checkpoint(
-    path: Path,
-    network: ActorCritic,
-    optimizer: Adam,
-    scheduler,
-) -> int:
+def load_checkpoint(path: Path, network: ActorCritic, optimizer: Adam, scheduler) -> int:
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     network.load_state_dict(ckpt["network_state"])
     optimizer.load_state_dict(ckpt["optimizer_state"])
-    if scheduler and ckpt.get("scheduler_state"):
-        scheduler.load_state_dict(ckpt["scheduler_state"])
-    start_episode = int(ckpt.get("episode", 0))
-    print(f"[resume] Loaded checkpoint from episode {start_episode}: {path}")
-    return start_episode
-
-
-# ---------------------------------------------------------------------------
-# CSV logging
-# ---------------------------------------------------------------------------
-
-def save_csv(path: Path, rows: List[Dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        return
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    if scheduler and ckpt.get("scheduler_state"): scheduler.load_state_dict(ckpt["scheduler_state"])
+    start_ep = int(ckpt.get("episode", 0))
+    print(f"[resume] Loaded checkpoint from episode {start_ep}")
+    return start_ep
 
 
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
-def train(args: argparse.Namespace) -> None:
+def train(args: argparse.Namespace):
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-    if args.device == "cuda" and not torch.cuda.is_available():
-        print("[warn] CUDA not available - falling back to CPU.")
-
-    print(f"[config] device={device}  episodes={args.episodes}  batch={args.update_every} eps  "
-          f"hidden={args.hidden_sizes}  frames={args.history_length}")
-    print(f"[config] curriculum: {args.difficulty_schedule}")
-    print(f"[config] PPO clip_eps={args.clip_eps}  entropy={args.entropy_coef}  lr={args.learning_rate}\n")
+    if args.server:
+        env = HttpPyreEnv(base_url=args.server)
+        if not env.health_check(): sys.exit(f"[error] Server not reachable at {args.server}")
+    else:
+        if PyreEnvironment is None: sys.exit("[error] PyreEnvironment not found. Use --server.")
+        env = PyreEnvironment(max_steps=args.max_steps)
 
     encoder = ObservationEncoder(mode=args.observation_mode)
     input_dim = encoder.base_dim * args.history_length
-
     hidden_sizes = tuple(int(h) for h in args.hidden_sizes.split(","))
     network = ActorCritic(input_dim=input_dim, action_dim=ACTION_DIM, hidden_sizes=hidden_sizes).to(device)
     optimizer = Adam(network.parameters(), lr=args.learning_rate, eps=1e-5)
+    scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=args.lr_end_factor, total_iters=max(1, args.episodes // args.update_every)) if args.lr_decay else None
 
-    total_steps_for_scheduler = args.episodes // args.update_every
-    scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=args.lr_end_factor,
-                          total_iters=max(1, total_steps_for_scheduler)) if args.lr_decay else None
-
-    env = PyreEnvironment(max_steps=args.max_steps)
-
-    # Build curriculum — patience-gated (dynamic) or static
     stages = [s.strip().lower() for s in args.difficulty_schedule.split(",") if s.strip()]
     if args.patience_threshold > 0:
-        mix_dist = parse_mix_dist(getattr(args, "hard_mix_dist", None))
-        patience_curriculum = PatienceCurriculum(
-            stages=stages,
-            threshold=args.patience_threshold,
-            patience_window=args.patience_window,
-            mix_ratio=args.hard_mix_ratio,
-            mix_dist=mix_dist,
-        )
-        static_curriculum: Optional[List[str]] = None
-        if mix_dist is not None:
-            print(f"[curriculum] hard-phase mix distribution: {mix_dist}")
-        print(f"[curriculum] patience-gated: threshold={args.patience_threshold}  "
-              f"window={args.patience_window}  mix={args.hard_mix_ratio}")
+        curriculum = PatienceCurriculum(stages=stages, threshold=args.patience_threshold, patience_window=args.patience_window, mix_ratio=args.hard_mix_ratio, mix_dist=parse_mix_dist(getattr(args, "hard_mix_dist", None)))
+        static_curriculum = None
     else:
-        patience_curriculum = None
+        curriculum = None
         static_curriculum = build_curriculum(args.difficulty_schedule, args.episodes)
-        print(f"[curriculum] static: {args.difficulty_schedule}")
 
-    start_episode = 0
-    if args.resume:
-        resume_path = Path(args.resume)
-        if resume_path.exists():
-            start_episode = load_checkpoint(resume_path, network, optimizer, scheduler)
+    start_ep = 0
+    if args.resume and Path(args.resume).exists():
+        start_ep = load_checkpoint(Path(args.resume), network, optimizer, scheduler)
 
-    # Tracking
     buffer = RolloutBuffer()
-    episode_rows: List[Dict] = []
-    eval_rows: List[Dict] = []
-    reward_window: deque = deque(maxlen=30)
-    success_window: deque = deque(maxlen=30)
-
-    n_params = sum(p.numel() for p in network.parameters())
-    print(f"[network] Parameters: {n_params:,}")
-    print(f"[network] Input dim:  {input_dim:,}  (encoder.base_dim={encoder.base_dim} x {args.history_length} frames)")
-    print(f"[network] Action dim: {ACTION_DIM}  (4 move + 4 look + 1 wait + {MAX_DOORS} open + {MAX_DOORS} close)")
-    print()
-
+    episode_rows, eval_rows = [], []
+    reward_window, success_window = deque(maxlen=30), deque(maxlen=30)
     t_start = time.time()
+    next_ep_diff = curriculum.stages[0] if curriculum else None
 
-    for ep_idx in range(start_episode, args.episodes):
-        # Determine difficulty for this episode
-        if patience_curriculum is not None:
-            difficulty = patience_curriculum.current
-        else:
-            difficulty = static_curriculum[ep_idx]  # type: ignore[index]
-
-        result = run_episode(
-            env=env, network=network, encoder=encoder, device=device,
-            difficulty=difficulty, history_length=args.history_length,
-            buffer=buffer, deterministic=False,
-        )
-
-        reward_window.append(result.total_reward)
-        success_window.append(float(result.evacuated))
-
-        # Advance patience curriculum *after* updating success_window
-        if patience_curriculum is not None:
-            difficulty = patience_curriculum.step(float(np.mean(success_window)))
-
+    for ep_idx in range(start_ep, args.episodes):
+        play_diff = next_ep_diff if curriculum else static_curriculum[ep_idx]
         ep_num = ep_idx + 1
-        episode_rows.append({
-            "episode": ep_num,
-            "difficulty": difficulty,
-            "reward": round(result.total_reward, 4),
-            "evacuated": int(result.evacuated),
-            "steps": result.steps,
-            "final_health": round(result.final_health, 2),
-            "reward_mean_30": round(float(np.mean(reward_window)), 4),
-            "success_rate_30": round(float(np.mean(success_window)), 4),
-        })
+        ep_step_delay = args.step_delay if ep_num > args.viz_after_ep else 0.0
 
-        elapsed = time.time() - t_start
-        print(
-            f"ep={ep_num:04d} [{difficulty:<6}] "
-            f"steps={result.steps:03d}  "
-            f"reward={result.total_reward:+8.3f}  "
-            f"evac={int(result.evacuated)}  "
-            f"hp={result.final_health:5.1f}  "
-            f"suc30={float(np.mean(success_window)):.2f}  "
-            f"r30={float(np.mean(reward_window)):+7.2f}  "
-            f"t={elapsed:.0f}s"
-        )
+        result = run_episode(env=env, network=network, encoder=encoder, device=device, difficulty=play_diff, history_length=args.history_length, buffer=buffer, verbose=args.verbose, step_delay=ep_step_delay)
+        reward_window.append(result.total_reward); success_window.append(float(result.evacuated))
+        if curriculum: next_ep_diff = curriculum.step(float(np.mean(success_window)))
 
-        # PPO update every N episodes
-        should_update = (ep_num % args.update_every == 0) or (ep_num == args.episodes)
-        if should_update and len(buffer) > 0:
-            ppo_metrics = ppo_update(
-                network=network, optimizer=optimizer, buffer=buffer, device=device,
-                clip_eps=args.clip_eps, value_clip_eps=args.clip_eps,
-                entropy_coef=args.entropy_coef, value_coef=args.value_coef,
-                n_epochs=args.update_epochs, minibatch_size=args.minibatch_size,
-                gamma=args.gamma, gae_lambda=args.gae_lambda,
-                max_grad_norm=args.max_grad_norm,
-            )
-            if scheduler:
-                scheduler.step()
+        episode_rows.append({"episode": ep_num, "difficulty": play_diff, "reward": round(result.total_reward, 4), "evacuated": int(result.evacuated), "steps": result.steps, "hp": round(result.final_health, 2), "r30": round(float(np.mean(reward_window)), 4), "s30": round(float(np.mean(success_window)), 4)})
+        print(f"ep={ep_num:04d} [{play_diff:<6}] steps={result.steps:03d} reward={result.total_reward:+8.3f} evac={int(result.evacuated)} hp={result.final_health:5.1f} s30={float(np.mean(success_window)):.2f} t={time.time()-t_start:.0f}s")
+
+        if (ep_num % args.update_every == 0) or (ep_num == args.episodes):
+            metrics = ppo_update(network, optimizer, buffer, device, args.clip_eps, args.clip_eps, args.entropy_coef, args.value_coef, args.update_epochs, args.minibatch_size, args.gamma, args.gae_lambda, args.max_grad_norm)
+            if scheduler: scheduler.step()
             buffer.clear()
+            print(f"  >> PPO update pi_loss={metrics['policy_loss']:+.4f} v_loss={metrics['value_loss']:.4f} entropy={metrics['entropy']:.4f} kl={metrics['approx_kl']:.4f} lr={optimizer.param_groups[0]['lr']:.2e}")
 
-            cur_lr = optimizer.param_groups[0]["lr"]
-            print(
-                f"  >> PPO update  samples={len(buffer) if len(buffer) > 0 else 'flushed'}  "
-                f"pi_loss={ppo_metrics['policy_loss']:+.4f}  "
-                f"v_loss={ppo_metrics['value_loss']:.4f}  "
-                f"entropy={ppo_metrics['entropy']:.4f}  "
-                f"kl={ppo_metrics['approx_kl']:.4f}  "
-                f"clip%={ppo_metrics['clip_frac']:.2f}  "
-                f"lr={cur_lr:.2e}"
-            )
-
-        # Periodic evaluation
         if args.eval_every > 0 and (ep_num % args.eval_every == 0 or ep_num == args.episodes):
-            eval_m = evaluate_policy(
-                env=env, network=network, encoder=encoder, device=device,
-                difficulty=args.eval_difficulty, history_length=args.history_length,
-                n_episodes=args.eval_episodes,
-            )
+            eval_m = evaluate_policy(env, network, encoder, device, args.eval_difficulty, args.history_length, args.eval_episodes)
             eval_rows.append({"episode": ep_num, "difficulty": args.eval_difficulty, **{k: round(v, 4) for k, v in eval_m.items()}})
-            print(
-                f"  ** EVAL [{args.eval_difficulty}]  "
-                f"reward={eval_m['reward_mean']:+.3f}  "
-                f"success={eval_m['success_rate']:.2f}  "
-                f"steps={eval_m['steps_mean']:.1f}"
-            )
+            print(f"  ** EVAL [{args.eval_difficulty}] reward={eval_m['reward_mean']:+.3f} success={eval_m['success_rate']:.2f}")
 
-        # Periodic checkpoint
         if args.checkpoint and args.checkpoint_every > 0 and ep_num % args.checkpoint_every == 0:
             save_checkpoint(Path(args.checkpoint), network, optimizer, scheduler, ep_num, args)
-            print(f"  [ckpt] saved -> {args.checkpoint}")
 
-    # Final save
     if args.output:
         out = Path(args.output)
         save_checkpoint(out, network, optimizer, scheduler, args.episodes, args)
-        print(f"\n[done] Model saved -> {out}")
-
         if args.save_metrics:
-            csv_path = out.with_suffix(".csv")
-            save_csv(csv_path, episode_rows)
-            print(f"[done] Metrics CSV  -> {csv_path}")
+            save_csv(out.with_suffix(".csv"), episode_rows)
+            if eval_rows: save_csv(out.parent / (out.stem + "_eval.csv"), eval_rows)
+        if args.save_graph: save_training_graph_png(out.with_suffix(".png"), episode_rows, eval_rows)
 
-        if eval_rows:
-            eval_csv = out.parent / (out.stem + "_eval.csv")
-            save_csv(eval_csv, eval_rows)
-            print(f"[done] Eval CSV     -> {eval_csv}")
+def save_csv(path: Path, rows: List[Dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows: return
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader(); writer.writerows(rows)
 
-        if args.save_graph:
-            png_path = out.with_suffix(".png")
-            save_training_graph_png(png_path, episode_rows, eval_rows)
-            print(f"[done] Graph PNG    -> {png_path}")
-
-    total_time = time.time() - t_start
-    print(f"\n[summary] {args.episodes - start_episode} episodes in {total_time:.1f}s  "
-          f"({(args.episodes - start_episode) / max(1, total_time):.1f} eps/s)")
-    print(f"[summary] Final success rate (last 30): {float(np.mean(success_window)):.2f}")
-    print(f"[summary] Final reward mean  (last 30): {float(np.mean(reward_window)):+.3f}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def describe_env() -> None:
-    print(__doc__)
-
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="PPO training for Pyre fire-evacuation environment",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # Training scale
-    p.add_argument("--episodes", type=int, default=400, help="Total training episodes")
-    p.add_argument("--max-steps", type=int, default=150, help="Max steps per episode")
-    p.add_argument("--device", type=str, default="cuda", choices=("cuda", "cpu"), help="Torch device")
-
-    # Curriculum
-    p.add_argument("--difficulty", type=str, default="easy", choices=DIFFICULTIES,
-                   help="Single difficulty (overridden by --difficulty-schedule if set)")
-    p.add_argument("--difficulty-schedule", type=str, default="easy,medium,hard",
-                   help="Comma-separated curriculum stages. With --patience-threshold>0 these "
-                        "become gated stages; otherwise split evenly across episodes.")
-    p.add_argument("--patience-threshold", type=float, default=0.65,
-                   help="Success-rate threshold (30-ep window) required before advancing to next "
-                        "difficulty. Set 0 to use static even-split schedule.")
-    p.add_argument("--patience-window", type=int, default=15,
-                   help="Episodes that must sustain >= patience-threshold before advancing.")
-    p.add_argument("--hard-mix-ratio", type=float, default=0.25,
-                   help="Fraction of hard-phase episodes to replay on medium (0=pure hard). "
-                        "Prevents catastrophic forgetting of the medium policy. "
-                        "Ignored when --hard-mix-dist is set.")
-    p.add_argument("--hard-mix-dist", type=str, default=None,
-                   help="Cumulative replay distribution for the final stage, e.g. "
-                        "'hard:0.6,medium:0.3,easy:0.1'. Overrides --hard-mix-ratio.")
-    p.add_argument("--eval-difficulty", type=str, default="medium", choices=DIFFICULTIES)
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--server", type=str, default=None)
+    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--step-delay", type=float, default=0.0)
+    p.add_argument("--viz-after-ep", type=int, default=1000000)
+    p.add_argument("--episodes", type=int, default=400)
+    p.add_argument("--max-steps", type=int, default=150)
+    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--difficulty-schedule", type=str, default="easy,medium,hard_fixed,hard")
+    p.add_argument("--patience-threshold", type=float, default=0.65)
+    p.add_argument("--patience-window", type=int, default=15)
+    p.add_argument("--hard-mix-ratio", type=float, default=0.25)
+    p.add_argument("--hard-mix-dist", type=str, default=None)
+    p.add_argument("--eval-difficulty", type=str, default="medium")
     p.add_argument("--eval-episodes", type=int, default=10)
     p.add_argument("--eval-every", type=int, default=50)
-
-    # Observation
-    p.add_argument("--observation-mode", type=str, default="visible", choices=("visible", "full"),
-                   help="'visible': partial obs (realistic); 'full': oracle grid (debug)")
-    p.add_argument("--history-length", type=int, default=4,
-                   help="Frames stacked per observation (temporal context for partial obs)")
-
-    # Network
-    p.add_argument("--hidden-sizes", type=str, default="512,256,128",
-                   help="Comma-separated MLP hidden layer sizes")
-
-    # PPO hyperparameters
-    p.add_argument("--update-every", type=int, default=5,
-                   help="Episodes between PPO updates (smaller = faster feedback loop early in training)")
-    p.add_argument("--update-epochs", type=int, default=4,
-                   help="Gradient passes over each collected batch (PPO allows >1)")
+    p.add_argument("--observation-mode", type=str, default="visible", choices=("visible", "full"))
+    p.add_argument("--history-length", type=int, default=4)
+    p.add_argument("--hidden-sizes", type=str, default="512,256,128")
+    p.add_argument("--update-every", type=int, default=5)
+    p.add_argument("--update-epochs", type=int, default=4)
     p.add_argument("--minibatch-size", type=int, default=256)
-    p.add_argument("--clip-eps", type=float, default=0.2, help="PPO surrogate clip ε")
-    p.add_argument("--entropy-coef", type=float, default=0.03,
-                   help="Entropy bonus coefficient — higher = more exploration (0.03 default encourages early exit-seeking)")
+    p.add_argument("--clip-eps", type=float, default=0.2)
+    p.add_argument("--entropy-coef", type=float, default=0.03)
     p.add_argument("--value-coef", type=float, default=0.5)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--gae-lambda", type=float, default=0.95)
     p.add_argument("--max-grad-norm", type=float, default=0.5)
-
-    # Optimizer / LR schedule
     p.add_argument("--learning-rate", type=float, default=3e-4)
-    p.add_argument("--lr-decay", action="store_true", default=True,
-                   help="Linear LR decay to lr_end_factor × initial_lr over training")
-    p.add_argument("--lr-end-factor", type=float, default=0.1,
-                   help="LR at end of training = initial_lr × this value")
-
-    # Persistence
-    p.add_argument("--output", type=str, default="artifacts/pyre_ppo.pt",
-                   help="Path to save final model checkpoint")
-    p.add_argument("--checkpoint", type=str, default="artifacts/pyre_ppo_checkpoint.pt",
-                   help="Path for periodic checkpoints (also used by --resume)")
+    p.add_argument("--lr-decay", action="store_true", default=True)
+    p.add_argument("--lr-end-factor", type=float, default=0.1)
+    p.add_argument("--output", type=str, default="artifacts/pyre_ppo.pt")
+    p.add_argument("--checkpoint", type=str, default="artifacts/pyre_ppo_checkpoint.pt")
     p.add_argument("--checkpoint-every", type=int, default=50)
-    p.add_argument("--resume", type=str, default=None,
-                   help="Path to checkpoint to resume training from")
-    p.add_argument("--save-metrics", action="store_true", default=True,
-                   help="Save per-episode metrics as CSV alongside the model")
-    p.add_argument("--save-graph", action="store_true", default=True,
-                   help="Save a PNG training graph alongside the model (requires matplotlib)")
-    p.add_argument("--log-file", type=str, default=None,
-                   help="Path to write a copy of all console output (e.g. artifacts/train.log). "
-                        "Output is written to both the terminal and the file simultaneously.")
-
-    # Misc
+    p.add_argument("--resume", type=str, default=None)
+    p.add_argument("--save-metrics", action="store_true", default=True)
+    p.add_argument("--save-graph", action="store_true", default=True)
+    p.add_argument("--log-file", type=str, default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--describe-only", action="store_true",
-                   help="Print environment/algorithm description and exit")
-
+    p.add_argument("--describe-only", action="store_true")
     return p.parse_args()
 
-
-def main() -> None:
-    args = parse_args()
-
-    if args.describe_only:
-        describe_env()
-        return
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    log_tee = None
-    if args.log_file:
-        log_path = Path(args.log_file)
-        log_tee = TeeLogger(sys.stdout, log_path)
-        sys.stdout = log_tee  # type: ignore[assignment]
-        print(f"[log] Writing console output to {log_path}", flush=True)
-
-    try:
-        train(args)
-    finally:
-        if log_tee:
-            sys.stdout = log_tee._stream
-            log_tee.close()
-            print(f"[log] Training log saved -> {args.log_file}")
-
-
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.describe_only: print(__doc__); sys.exit(0)
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    log_tee = TeeLogger(sys.stdout, Path(args.log_file)) if args.log_file else None
+    if log_tee: sys.stdout = log_tee
+    try: train(args)
+    finally:
+        if log_tee: log_tee.close()

@@ -30,7 +30,6 @@ function App() {
 
   const prevAgentPos  = useRef({ x: -1, y: -1 });
   const autoWaitTimer = useRef<number | null>(null);
-  const pollTimer     = useRef<number | null>(null);
   const logEndRef     = useRef<HTMLDivElement | null>(null);
 
   /* scroll event log to bottom */
@@ -160,70 +159,6 @@ function App() {
     }
   };
 
-  const fetchAndApplyScene = useCallback(async () => {
-    try {
-      const res = await fetch('/scene');
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const scene: SceneResponse = await res.json();
-      setSceneData(scene);
-      updateReport('scene', {}, scene);
-
-      const { labels, graph } = scene;
-      const cell_grid:  number[] = [];
-      const fire_grid:  number[] = [];
-      const smoke_grid: number[] = [];
-
-      for (let y = 0; y < graph.height; y++) {
-        for (let x = 0; x < graph.width; x++) {
-          const [type, fire, smoke] = graph.grid[y][x];
-          cell_grid.push(type);
-          fire_grid.push(fire);
-          smoke_grid.push(smoke);
-        }
-      }
-
-      const visible_cells: [number, number][] = [];
-      for (let y = 0; y < graph.height; y++) {
-        for (let x = 0; x < graph.width; x++) {
-          if (graph.grid[y][x][4] === 1.0) visible_cells.push([x, y]);
-        }
-      }
-
-      const pseudoObs: Observation = {
-        map_state: {
-          cell_grid, fire_grid, smoke_grid,
-          agent_x:      labels.agent.x,
-          agent_y:      labels.agent.y,
-          visible_cells,
-          door_registry:  labels.map.door_registry,
-          exit_positions: labels.map.exit_positions,
-          step_count:     labels.episode.step,
-          max_steps:      labels.episode.max_steps,
-          grid_w:         graph.width,
-          grid_h:         graph.height,
-          template_name:  labels.episode.template,
-        },
-        agent_health:         labels.agent.health,
-        location_label:       labels.agent.location,
-        smoke_level:          labels.agent.smoke_level,
-        wind_dir:             labels.episode.wind_dir,
-        fire_visible:         labels.agent.fire_visible,
-        fire_direction:       labels.agent.fire_direction,
-        last_action_feedback: labels.agent.last_action_feedback,
-        narrative: '',
-        metadata: {
-          fire_sources:    labels.episode.fire_sources,
-          fire_spread_rate:labels.episode.fire_spread_rate,
-          humidity:        labels.episode.humidity,
-          difficulty:      labels.episode.difficulty,
-        },
-      };
-      applyObservation(pseudoObs);
-    } catch (err: any) {
-      setStatusMsg(`Sync Error: ${err.message}`, true);
-    }
-  }, [applyObservation, observation?.metadata]);
-
   useEffect(() => {
     if (isAutoWait) {
       autoWaitTimer.current = window.setInterval(() => runAction({ action: 'wait' }, 'AUTO WAIT'), 900);
@@ -235,13 +170,82 @@ function App() {
 
   useEffect(() => {
     if (isPolling) {
-      fetchAndApplyScene();
-      pollTimer.current = window.setInterval(fetchAndApplyScene, 500);
-    } else {
-      if (pollTimer.current) clearInterval(pollTimer.current);
+      const es = new EventSource('/live-movements');
+      
+      es.onmessage = (event) => {
+        try {
+          const scene: SceneResponse = JSON.parse(event.data);
+          if (scene.error) {
+            console.error('SSE data error:', scene.error);
+            return;
+          }
+          setSceneData(scene);
+          updateReport('scene', {}, scene);
+
+          const { labels, graph } = scene;
+          const cell_grid:  number[] = [];
+          const fire_grid:  number[] = [];
+          const smoke_grid: number[] = [];
+
+          for (let y = 0; y < graph.height; y++) {
+            for (let x = 0; x < graph.width; x++) {
+              const [type, fire, smoke] = graph.grid[y][x];
+              cell_grid.push(type);
+              fire_grid.push(fire);
+              smoke_grid.push(smoke);
+            }
+          }
+
+          const visible_cells: [number, number][] = [];
+          for (let y = 0; y < graph.height; y++) {
+            for (let x = 0; x < graph.width; x++) {
+              if (graph.grid[y][x][4] === 1.0) visible_cells.push([x, y]);
+            }
+          }
+
+          const pseudoObs: Observation = {
+            map_state: {
+              cell_grid, fire_grid, smoke_grid,
+              agent_x:      labels.agent.x,
+              agent_y:      labels.agent.y,
+              visible_cells,
+              door_registry:  labels.map.door_registry,
+              exit_positions: labels.map.exit_positions,
+              step_count:     labels.episode.step,
+              max_steps:      labels.episode.max_steps,
+              grid_w:         graph.width,
+              grid_h:         graph.height,
+              template_name:  labels.episode.template,
+            },
+            agent_health:         labels.agent.health,
+            location_label:       labels.agent.location,
+            smoke_level:          labels.agent.smoke_level,
+            wind_dir:             labels.episode.wind_dir,
+            fire_visible:         labels.agent.fire_visible,
+            fire_direction:       labels.agent.fire_direction,
+            last_action_feedback: labels.agent.last_action_feedback,
+            narrative: '',
+            metadata: {
+              fire_sources:    labels.episode.fire_sources,
+              fire_spread_rate:labels.episode.fire_spread_rate,
+              humidity:        labels.episode.humidity,
+              difficulty:      labels.episode.difficulty,
+            },
+          };
+          applyObservation(pseudoObs);
+        } catch (err: any) {
+          setStatusMsg(`SSE Parse Error: ${err.message}`, true);
+        }
+      };
+
+      es.onerror = (err) => {
+        console.error('SSE Error:', err);
+        setStatusMsg('SSE Connection lost. Retrying...', true);
+      };
+
+      return () => es.close();
     }
-    return () => { if (pollTimer.current) clearInterval(pollTimer.current); };
-  }, [isPolling, fetchAndApplyScene]);
+  }, [isPolling, applyObservation, updateReport, applyObservation]); // Note: dependencies updated to include needed setters
 
   useEffect(() => {
     if (agentMoveFlash > 0) {

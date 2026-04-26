@@ -6,14 +6,11 @@ interface HUDProps {
   agentMoveCount?: number;
 }
 
-/* Unicode compass arrows for each wind direction */
-const WIND_ARROW: Record<string, string> = {
-  N: '↑', S: '↓', E: '→', W: '←',
-  NE: '↗', NW: '↖', SE: '↘', SW: '↙',
-  CALM: '·',
-};
+/* Single arrow rotated to point in the wind direction */
+const WIND_ARROW = '↑';
+const WIND_CALM_SYMBOL = '·';
 
-/* Rotation degrees so the arrow visually points in the right direction */
+/* Rotation degrees: 0° = North (up), clockwise positive */
 const WIND_DEG: Record<string, number> = {
   N: 0, NE: 45, E: 90, SE: 135,
   S: 180, SW: 225, W: 270, NW: 315, CALM: 0,
@@ -48,9 +45,9 @@ const HUD: React.FC<HUDProps> = ({ observation, agentMoveCount = 0 }) => {
   if (hPct < 30)      { hBarClass = 'c'; hStatusLabel = 'Critical'; hStatusClass = 'critical'; }
   else if (hPct < 60) { hBarClass = 'm'; hStatusLabel = 'Moderate'; hStatusClass = 'moderate'; }
 
-  const windDir    = wind_dir || 'CALM';
-  const windArrow  = WIND_ARROW[windDir] ?? '?';
-  const windDeg    = WIND_DEG[windDir]   ?? 0;
+  const windDir   = wind_dir || 'CALM';
+  const windArrow = windDir === 'CALM' ? WIND_CALM_SYMBOL : WIND_ARROW;
+  const windDeg   = WIND_DEG[windDir] ?? 0;
   const spreadRate = metadata?.fire_spread_rate ?? 0;
   const humidity   = metadata?.humidity ?? 0;
 

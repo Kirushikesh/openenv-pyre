@@ -119,6 +119,7 @@ def build_narrative_observation(
     wind_dir: str,
     w: int,
     h: int,
+    visible_override: Optional[Set[Tuple[int, int]]] = None,
 ) -> Dict[str, Any]:
     """Build the full observation dict (matches PyreObservation fields)."""
     if agent_evacuated:
@@ -131,7 +132,9 @@ def build_narrative_observation(
                              narrative="You have been overcome by fire and smoke.",
                              agent_evacuated=False, agent_health=0.0)
 
-    visible = compute_visible_cells(agent_x, agent_y, cell_grid, smoke_grid, w, h)
+    visible = visible_override if visible_override is not None else compute_visible_cells(
+        agent_x, agent_y, cell_grid, smoke_grid, w, h
+    )
 
     # --- Agent cell conditions ---
     agent_smoke = smoke_grid[_idx(agent_x, agent_y, w)]
@@ -279,16 +282,13 @@ def _build_action_hints(
 ) -> List[str]:
     hints: List[str] = []
 
-    # Movement and look hints per direction
+    # Movement hints per direction
     for dx, dy, dirname in _CARDINAL:
         nx, ny = ax + dx, ay + dy
         if _in_bounds(nx, ny, w, h):
             ct = cell_grid[_idx(nx, ny, w)]
             if ct in (FLOOR, DOOR_OPEN, EXIT):
                 hints.append(f"move(direction='{dirname}')")
-            # Suggest look for any non-wall direction (including closed doors/obstacles)
-            if ct != WALL:
-                hints.append(f"look(direction='{dirname}')")
 
     # Door actions
     for obj in visible_objects:

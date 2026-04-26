@@ -9,12 +9,15 @@ Configuration via environment variables:
 """
 
 import os
+import asyncio
+import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, AsyncGenerator
 from pydantic import Field, BaseModel
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from sse_starlette.sse import EventSourceResponse
 from openenv.core.env_server.http_server import create_app
 from starlette.routing import Route
 
@@ -263,6 +266,29 @@ def get_scene() -> Dict[str, Any]:
     }
 
     return {"labels": labels, "graph": graph}
+
+
+async def event_generator(request: Request) -> AsyncGenerator[Dict[str, Any], None]:
+    """Async generator for Server-Sent Events."""
+    while True:
+        if await request.is_disconnected():
+            break
+        
+        try:
+            # Re-use the logic from get_scene() but in an async-friendly way
+            # We call get_scene directly here as it's a simple synchronous function
+            # and won't block the event loop for long.
+            scene_data = get_scene()
+            yield {"data": json.dumps(scene_data)}
+        except Exception as e:
+            yield {"data": json.dumps({"error": str(e)})}
+            
+        await asyncio.sleep(0.5)  # Update every 500ms as requested
+
+
+@app.get("/live-movements")
+async def stream_movements(request: Request):
+    return EventSourceResponse(event_generator(request))
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
